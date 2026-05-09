@@ -338,7 +338,10 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         // the always-on block so it works regardless of which tab or panel
         // owns focus; overlays (quick-open, global-search, hosts picker)
         // return earlier so they're unaffected.
-        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('b')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
             app.toggle_sidebar();
             return;
         }

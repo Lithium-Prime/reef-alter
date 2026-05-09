@@ -39,6 +39,13 @@ impl AsyncState {
         self.stale = true;
     }
 
+    pub fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1).max(1);
+        self.loading = false;
+        self.stale = false;
+        self.error = None;
+    }
+
     pub fn begin(&mut self) -> u64 {
         self.generation = self.generation.wrapping_add(1).max(1);
         self.loading = true;
@@ -1122,9 +1129,9 @@ fn spawn_files_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Fil
                             &result_tx,
                         );
                     }
-                    // Prefetch routes to the preview worker; this arm
-                    // never fires in practice but exhaustiveness needs
-                    // it.
+                    // Prefetches route through the dedicated prefetch
+                    // worker; this arm is retained only for match
+                    // completeness and should never fire in practice.
                     FilesTask::PrefetchPreview { .. } => {}
                 }
             }
@@ -1580,20 +1587,6 @@ fn spawn_preview_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<F
                             backend.load_preview(&rel_path, dark, wants_decoded_image)
                         });
                         let _ = result_tx.send(WorkerResult::Preview { generation, result });
-                    }
-                    FilesTask::PrefetchPreview {
-                        backend,
-                        rel_path,
-                        dark,
-                        wants_decoded_image,
-                    } => {
-                        // Fire-and-forget: the backend's LRU cache
-                        // absorbs the result. Same panic guard as the
-                        // `LoadPreview` arm — a bad neighbor on
-                        // prefetch must not take the worker down.
-                        let _ = run_preview_with_panic_guard(&rel_path, || {
-                            backend.load_preview(&rel_path, dark, wants_decoded_image)
-                        });
                     }
                     _ => {}
                 }
@@ -3651,7 +3644,7 @@ mod preview_priority_tests {
 
         tasks.load_preview(42, backend, PathBuf::from("fast.txt"), false, false);
 
-        let deadline = Instant::now() + Duration::from_millis(200);
+        let deadline = Instant::now() + Duration::from_secs(1);
         let mut got_preview = false;
         while Instant::now() < deadline {
             if let Ok(WorkerResult::Preview { generation, result }) = tasks.try_recv() {

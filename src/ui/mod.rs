@@ -932,13 +932,17 @@ fn render_branch_create_dialog(f: &mut Frame, app: &mut App, screen: Rect) {
         return;
     };
     let choices = app.branch_create_base_choices();
-    let popup_w = 56u16.min(screen.width.saturating_sub(2).max(24));
+    let popup_w = 56u16
+        .min(screen.width.saturating_sub(2).max(24))
+        .min(screen.width);
     let content_h = match &dialog.step {
         BranchCreateStep::ChooseMode => 5,
         BranchCreateStep::ChooseBase => choices.len().min(8) as u16 + 3,
         BranchCreateStep::EnterName { .. } => 6,
     };
-    let popup_h = content_h.min(screen.height.saturating_sub(2).max(6));
+    let popup_h = content_h
+        .min(screen.height.saturating_sub(2).max(6))
+        .min(screen.height);
     let area = Rect::new(
         screen.x + screen.width.saturating_sub(popup_w) / 2,
         screen.y + screen.height.saturating_sub(popup_h) / 2,

@@ -3740,16 +3740,36 @@ impl App {
             "status.selected_repo",
             &crate::backend::repo_key(&repo_root_rel),
         );
+        self.reset_git_snapshot_for_repo_switch();
+        self.refresh_status();
+        self.graph_load.invalidate_stale();
+    }
+
+    fn reset_git_snapshot_for_repo_switch(&mut self) {
         self.selected_file = None;
         self.diff_content = None;
         self.diff_scroll = 0;
         self.diff_h_scroll = 0;
         self.git_status.confirm_discard = None;
+        self.git_status.confirm_push = false;
+        self.git_status.confirm_force_push = false;
         self.git_status.branch_dropdown_open = false;
         self.git_status.repo_selector_open = false;
+        self.git_status.branch_dropdown_idx = 0;
+        self.git_status.stashes.clear();
+        self.git_status.selected_stash_idx = 0;
+        self.git_status.stash_detail = None;
+        self.git_status.stash_error = None;
+        self.git_status.pending_stash_action = None;
+        self.git_status.branch_create_dialog = None;
+        self.git_status.branches.clear();
         self.staged_files.clear();
         self.unstaged_files.clear();
+        self.branch_name.clear();
         self.git_status.ahead_behind = None;
+        self.git_status.push_error = None;
+        self.git_status.pull_error = None;
+        self.git_status.commit_error = None;
         self.git_graph.rows.clear();
         self.git_graph.ref_map.clear();
         self.git_graph.cache_key = None;
@@ -3759,8 +3779,7 @@ impl App {
         self.commit_detail.detail = None;
         self.commit_detail.range_detail = None;
         self.commit_detail.file_diff = None;
-        self.refresh_status();
-        self.graph_load.invalidate_stale();
+        self.stash_detail_load.invalidate();
     }
 
     fn repo_selector_effectively_open(&self) -> bool {
@@ -4105,11 +4124,15 @@ impl App {
     pub fn load_selected_stash_detail(&mut self) {
         let Some(stash_ref) = self.selected_stash_ref() else {
             self.git_status.stash_detail = None;
+            self.stash_detail_load.invalidate();
             return;
         };
         let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            self.git_status.stash_detail = None;
+            self.stash_detail_load.invalidate();
             return;
         };
+        self.git_status.stash_detail = None;
         let generation = self.stash_detail_load.begin();
         self.tasks.load_stash_detail(
             generation,
@@ -4848,6 +4871,7 @@ impl App {
                             self.load_selected_stash_detail();
                         } else {
                             self.git_status.stash_detail = None;
+                            self.stash_detail_load.invalidate();
                         }
                     }
                 }

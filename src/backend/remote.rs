@@ -44,6 +44,9 @@ const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// headroom for un-highlighted previews).
 const READ_FILE_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
+/// Keep stash detail replies comfortably below reef-proto's 16 MiB frame cap.
+const MAX_STASH_PATCH_BYTES: usize = 8 * 1024 * 1024;
+
 type PendingMap = HashMap<u64, mpsc::Sender<Response>>;
 /// `request_id` → sender for streaming `SearchChunk` notifications. The
 /// read thread consults this map on every `Notification::SearchChunk`
@@ -1728,22 +1731,41 @@ impl From<StashEntry> for reef_proto::StashEntryDto {
 
 impl From<reef_proto::StashDetailDto> for StashDetail {
     fn from(v: reef_proto::StashDetailDto) -> Self {
+        let patch = if v.patch_truncated {
+            format!("{}\n... stash patch truncated ...", v.patch)
+        } else {
+            v.patch
+        };
         StashDetail {
             entry: v.entry.into(),
             files: v.files.into_iter().map(Into::into).collect(),
-            patch: v.patch,
+            patch,
         }
     }
 }
 
 impl From<StashDetail> for reef_proto::StashDetailDto {
     fn from(v: StashDetail) -> Self {
+        let (patch, patch_truncated) = truncate_string_bytes(v.patch, MAX_STASH_PATCH_BYTES);
         reef_proto::StashDetailDto {
             entry: v.entry.into(),
             files: v.files.into_iter().map(Into::into).collect(),
-            patch: v.patch,
+            patch,
+            patch_truncated,
         }
     }
+}
+
+fn truncate_string_bytes(mut value: String, max_bytes: usize) -> (String, bool) {
+    if value.len() <= max_bytes {
+        return (value, false);
+    }
+    let mut cut = max_bytes;
+    while !value.is_char_boundary(cut) {
+        cut = cut.saturating_sub(1);
+    }
+    value.truncate(cut);
+    (value, true)
 }
 
 impl From<FileEntry> for reef_proto::FileEntryDto {

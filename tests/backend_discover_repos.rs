@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use reef::backend::{
     Backend, LocalBackend, RemoteBackend, RepoDiscoverOpts, normalize_repo_root_rel, repo_key,
 };
-use reef::git::StashPushOptions;
+use reef::git::{FileStatus, StashPushOptions};
 use tempfile::TempDir;
 use test_support::agent_bin;
 
@@ -811,6 +811,56 @@ fn stash_push_options_cover_data_preserving_modes() {
     backend
         .stash_drop_for(Path::new("only"), "stash@{0}")
         .unwrap();
+
+    write_file(&repo_path.join("added.txt"), "tracked add\n");
+    stage_file(&repo_path, "added.txt");
+    backend
+        .stash_push_for(
+            Path::new("only"),
+            &StashPushOptions {
+                message: "tracked add".to_string(),
+                include_untracked: false,
+                keep_index: false,
+                staged_only: false,
+                paths: Vec::new(),
+            },
+        )
+        .unwrap();
+    let detail = backend
+        .stash_detail_for(Path::new("only"), "stash@{0}")
+        .unwrap();
+    assert!(!detail.entry.includes_untracked);
+    assert!(detail.files.iter().any(|f| f.path == "added.txt"));
+    backend
+        .stash_drop_for(Path::new("only"), "stash@{0}")
+        .unwrap();
+
+    git_ok(&repo_path, &["mv", "b.txt", "renamed.txt"]);
+    backend
+        .stash_push_for(
+            Path::new("only"),
+            &StashPushOptions {
+                message: "renamed file".to_string(),
+                include_untracked: false,
+                keep_index: false,
+                staged_only: false,
+                paths: Vec::new(),
+            },
+        )
+        .unwrap();
+    let detail = backend
+        .stash_detail_for(Path::new("only"), "stash@{0}")
+        .unwrap();
+    assert!(
+        detail
+            .files
+            .iter()
+            .any(|f| f.path == "renamed.txt" && f.status == FileStatus::Renamed)
+    );
+    backend
+        .stash_drop_for(Path::new("only"), "stash@{0}")
+        .unwrap();
+    reset_hard(&repo_path);
 
     write_file(&repo_path.join("a.txt"), "a staged\n");
     stage_file(&repo_path, "a.txt");

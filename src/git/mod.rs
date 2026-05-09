@@ -820,6 +820,7 @@ fn stash_stats_at(workdir: &Path, stash_ref: &str) -> (usize, u32, u32, bool) {
             "stash",
             "show",
             "--numstat",
+            "-z",
             "--include-untracked",
             stash_ref,
         ],
@@ -828,29 +829,42 @@ fn stash_stats_at(workdir: &Path, stash_ref: &str) -> (usize, u32, u32, bool) {
     let mut files = 0;
     let mut insertions = 0;
     let mut deletions = 0;
-    for line in out.lines() {
-        let mut parts = line.split('\t');
-        let add = parts.next().unwrap_or("0");
-        let del = parts.next().unwrap_or("0");
-        if parts.next().is_some() {
-            files += 1;
-            insertions += add.parse::<u32>().unwrap_or(0);
-            deletions += del.parse::<u32>().unwrap_or(0);
+    for (_, (add, del)) in parse_numstat_z(&out) {
+        files += 1;
+        insertions += add;
+        deletions += del;
+    }
+    let includes_untracked = run_git_command(
+        workdir,
+        &["rev-parse", "--verify", &format!("{}^3", stash_ref)],
+    )
+    .is_ok();
+    (files, insertions, deletions, includes_untracked)
+}
+
+fn parse_numstat_z(nums: &str) -> HashMap<String, (u32, u32)> {
+    let mut stats = HashMap::new();
+    let mut parts = nums.split('\0');
+    while let Some(record) = parts.next() {
+        if record.is_empty() {
+            continue;
+        }
+        let mut fields = record.split('\t');
+        let additions = fields.next().unwrap_or("0").parse::<u32>().unwrap_or(0);
+        let deletions = fields.next().unwrap_or("0").parse::<u32>().unwrap_or(0);
+        let path = match fields.next() {
+            Some("") => {
+                let _old = parts.next();
+                parts.next().unwrap_or_default()
+            }
+            Some(path) => path,
+            None => "",
+        };
+        if !path.is_empty() {
+            stats.insert(path.to_string(), (additions, deletions));
         }
     }
-    let names = run_git_command(
-        workdir,
-        &[
-            "stash",
-            "show",
-            "--name-status",
-            "--include-untracked",
-            stash_ref,
-        ],
-    )
-    .unwrap_or_default();
-    let includes_untracked = names.lines().any(|line| line.starts_with("A\t"));
-    (files, insertions, deletions, includes_untracked)
+    stats
 }
 
 pub fn list_stashes_at(workdir: &Path) -> Result<Vec<StashEntry>, String> {
@@ -893,6 +907,7 @@ pub fn stash_detail_at(workdir: &Path, stash_ref: &str) -> Result<StashDetail, S
             "stash",
             "show",
             "--name-status",
+            "-z",
             "--include-untracked",
             stash_ref,
         ],
@@ -903,25 +918,26 @@ pub fn stash_detail_at(workdir: &Path, stash_ref: &str) -> Result<StashDetail, S
             "stash",
             "show",
             "--numstat",
+            "-z",
             "--include-untracked",
             stash_ref,
         ],
     )
     .unwrap_or_default();
-    let mut stats = HashMap::new();
-    for line in nums.lines() {
-        let mut parts = line.split('\t');
-        let add = parts.next().unwrap_or("0").parse::<u32>().unwrap_or(0);
-        let del = parts.next().unwrap_or("0").parse::<u32>().unwrap_or(0);
-        if let Some(path) = parts.next() {
-            stats.insert(path.to_string(), (add, del));
-        }
-    }
+    let stats = parse_numstat_z(&nums);
     let mut files = Vec::new();
-    for line in names.lines() {
-        let mut parts = line.split('\t');
-        let status_raw = parts.next().unwrap_or("M");
-        let path = parts.next().unwrap_or_default();
+    let mut parts = names.split('\0');
+    while let Some(status_raw) = parts.next() {
+        if status_raw.is_empty() {
+            continue;
+        }
+        let path = match status_raw.chars().next().unwrap_or('M') {
+            'R' | 'C' => {
+                let _old = parts.next();
+                parts.next().unwrap_or_default()
+            }
+            _ => parts.next().unwrap_or_default(),
+        };
         if path.is_empty() {
             continue;
         }

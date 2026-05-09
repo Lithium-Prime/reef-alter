@@ -675,19 +675,17 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             if !can_perform_git_writes(app) {
                 return true;
             }
+            let Some(sel) = app.selected_file.as_ref() else {
+                return true;
+            };
             app.git_status.keyboard_focus = GitKeyboardFocus::StashSelectedButton;
-            let paths = app
-                .selected_file
-                .as_ref()
-                .map(|sel| vec![sel.path.clone()])
-                .unwrap_or_default();
             app.prepare_stash_push(
                 crate::git::StashPushOptions {
                     message: app.default_stash_message(),
                     include_untracked: true,
                     keep_index: false,
                     staged_only: false,
-                    paths,
+                    paths: vec![sel.path.clone()],
                 },
                 "selected",
             );
@@ -1482,6 +1480,13 @@ fn push_branch_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: 
     };
     let branch_prefix = format!("{}: ", t(Msg::Branch));
     let branch_prefix_width = branch_prefix.width();
+    let branch_row_width = max_path.saturating_add(12);
+    let branch_arrow_width = if has_choices { arrow.width() } else { 0 };
+    let mut branch_label = app.branch_name.clone();
+    truncate_in_place(
+        &mut branch_label,
+        branch_row_width.saturating_sub(branch_prefix_width + branch_arrow_width),
+    );
     let mut spans = vec![
         RowSpan::styled(
             branch_prefix,
@@ -1493,7 +1498,7 @@ fn push_branch_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: 
             ),
         ),
         RowSpan::styled(
-            app.branch_name.clone(),
+            branch_label,
             apply_bg(
                 Style::default()
                     .fg(theme.accent)
@@ -2081,15 +2086,28 @@ fn push_stash_section(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &T
         return;
     }
 
-    let stash_option =
-        |focus: GitKeyboardFocus, text: &str, fg: Color, bold: bool, command: &str| -> RowSpan {
-            let bg = (app.git_status.keyboard_focus == focus).then_some(theme.selection_bg);
-            let mut style = apply_bg(Style::default().fg(fg), bg);
-            if bold {
-                style = style.add_modifier(Modifier::BOLD);
-            }
-            RowSpan::styled(text.to_string(), style).on_click(command, Value::Null)
-        };
+    let stash_option = |focus: GitKeyboardFocus,
+                        text: &str,
+                        fg: Color,
+                        bold: bool,
+                        command: &str,
+                        enabled: bool|
+     -> RowSpan {
+        let bg = (app.git_status.keyboard_focus == focus).then_some(theme.selection_bg);
+        let mut style = apply_bg(
+            Style::default().fg(if enabled { fg } else { theme.chrome_muted_fg }),
+            bg,
+        );
+        if bold {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        let span = RowSpan::styled(text.to_string(), style);
+        if enabled {
+            span.on_click(command, Value::Null)
+        } else {
+            span
+        }
+    };
     rows.push(Row::new(vec![
         RowSpan::plain("  "),
         stash_option(
@@ -2098,6 +2116,7 @@ fn push_stash_section(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &T
             Color::Blue,
             true,
             "git.stashPushAll",
+            true,
         ),
         stash_option(
             GitKeyboardFocus::StashTrackedButton,
@@ -2105,6 +2124,7 @@ fn push_stash_section(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &T
             theme.fg_secondary,
             false,
             "git.stashPushTracked",
+            true,
         ),
         stash_option(
             GitKeyboardFocus::StashKeepIndexButton,
@@ -2112,6 +2132,7 @@ fn push_stash_section(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &T
             theme.fg_secondary,
             false,
             "git.stashPushKeepIndex",
+            true,
         ),
         stash_option(
             GitKeyboardFocus::StashStagedButton,
@@ -2119,6 +2140,7 @@ fn push_stash_section(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &T
             theme.fg_secondary,
             false,
             "git.stashPushStaged",
+            true,
         ),
         stash_option(
             GitKeyboardFocus::StashSelectedButton,
@@ -2126,6 +2148,7 @@ fn push_stash_section(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &T
             theme.fg_secondary,
             false,
             "git.stashPushSelected",
+            app.selected_file.is_some(),
         ),
     ]));
 
@@ -2138,7 +2161,7 @@ fn push_stash_section(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &T
         return;
     }
 
-    for (idx, stash) in app.git_status.stashes.iter().take(5).enumerate() {
+    for (idx, stash) in app.git_status.stashes.iter().enumerate() {
         let focused = app.git_status.keyboard_focus == GitKeyboardFocus::Stashes
             && idx == app.git_status.selected_stash_idx;
         let bg = focused.then_some(theme.selection_bg);
@@ -2351,8 +2374,13 @@ fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Them
         },
     ];
 
+    let confirming = app.git_status.confirm_push
+        || app.git_status.confirm_force_push
+        || app.git_status.confirm_discard.is_some()
+        || app.git_status.pending_stash_action.is_some();
+
     if let Some((ahead, behind)) = app.git_status.ahead_behind {
-        if ahead > 0 && behind == 0 && !app.push_in_flight {
+        if ahead > 0 && behind == 0 && !app.push_in_flight && !confirming {
             let bg = if app.git_status.keyboard_focus == GitKeyboardFocus::PushButton {
                 theme.selection_bg
             } else {
@@ -2372,7 +2400,7 @@ fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Them
         }
     }
 
-    if app.should_offer_publish_branch() && !app.push_in_flight {
+    if app.should_offer_publish_branch() && !app.push_in_flight && !confirming {
         let bg = if app.git_status.keyboard_focus == GitKeyboardFocus::PublishBranchButton {
             theme.selection_bg
         } else {
@@ -2392,6 +2420,7 @@ fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Them
     }
 
     if !app.pull_in_flight
+        && !confirming
         && let Some((_, behind)) = app.git_status.ahead_behind
     {
         let bg = if app.git_status.keyboard_focus == GitKeyboardFocus::PullButton {
@@ -2412,22 +2441,24 @@ fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Them
         );
     }
 
-    let stash_bg = if app.git_status.keyboard_focus == GitKeyboardFocus::StashButton {
-        theme.selection_bg
-    } else {
-        Color::Blue
-    };
-    action_spans.push(RowSpan::plain("  "));
-    action_spans.push(
-        RowSpan::styled(
-            " ⚑ Stash ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(stash_bg)
-                .add_modifier(Modifier::BOLD),
-        )
-        .on_click("git.stashPush", Value::Null),
-    );
+    if !confirming {
+        let stash_bg = if app.git_status.keyboard_focus == GitKeyboardFocus::StashButton {
+            theme.selection_bg
+        } else {
+            Color::Blue
+        };
+        action_spans.push(RowSpan::plain("  "));
+        action_spans.push(
+            RowSpan::styled(
+                " ⚑ Stash ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(stash_bg)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .on_click("git.stashPush", Value::Null),
+        );
+    }
 
     action_spans.push(RowSpan::plain("  "));
     action_spans.push(RowSpan::styled(
@@ -2435,7 +2466,7 @@ fn push_commit_box(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: &Them
         Style::default().fg(theme.fg_secondary),
     ));
 
-    rows.push(Row::new(action_spans).on_click("git.commitSubmit", Value::Null));
+    rows.push(Row::new(action_spans));
 }
 
 /// Split `s` into `(first n chars, rest)` in char units so truncation

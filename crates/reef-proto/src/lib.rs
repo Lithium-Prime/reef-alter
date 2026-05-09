@@ -770,6 +770,8 @@ pub struct StashDetailDto {
     pub entry: StashEntryDto,
     pub files: Vec<FileEntryDto>,
     pub patch: String,
+    #[serde(default)]
+    pub patch_truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

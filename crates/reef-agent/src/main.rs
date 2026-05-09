@@ -426,40 +426,38 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             }
         }
         Request::ListStashes => match backend.list_stashes() {
-            Ok(entries) => Ok(serde_json::to_value(
+            Ok(entries) => serde_json::to_value(
                 entries
                     .into_iter()
                     .map(reef_proto::StashEntryDto::from)
                     .collect::<Vec<_>>(),
             )
-            .unwrap()),
+            .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
             Err(e) => Err(backend_err(e)),
         },
         Request::ListStashesFor { repo_root_rel } => {
             match backend.list_stashes_for(&PathBuf::from(repo_root_rel)) {
-                Ok(entries) => Ok(serde_json::to_value(
+                Ok(entries) => serde_json::to_value(
                     entries
                         .into_iter()
                         .map(reef_proto::StashEntryDto::from)
                         .collect::<Vec<_>>(),
                 )
-                .unwrap()),
+                .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
                 Err(e) => Err(backend_err(e)),
             }
         }
         Request::StashDetail { stash_ref } => match backend.stash_detail(&stash_ref) {
-            Ok(detail) => {
-                Ok(serde_json::to_value(reef_proto::StashDetailDto::from(detail)).unwrap())
-            }
+            Ok(detail) => serde_json::to_value(reef_proto::StashDetailDto::from(detail))
+                .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
             Err(e) => Err(backend_err(e)),
         },
         Request::StashDetailFor {
             repo_root_rel,
             stash_ref,
         } => match backend.stash_detail_for(&PathBuf::from(repo_root_rel), &stash_ref) {
-            Ok(detail) => {
-                Ok(serde_json::to_value(reef_proto::StashDetailDto::from(detail)).unwrap())
-            }
+            Ok(detail) => serde_json::to_value(reef_proto::StashDetailDto::from(detail))
+                .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
             Err(e) => Err(backend_err(e)),
         },
         Request::StashPush { options } => {

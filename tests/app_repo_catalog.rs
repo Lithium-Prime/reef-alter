@@ -166,6 +166,15 @@ fn wait_for_push(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         app.tick();
+        if app.push_in_flight {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(app.push_in_flight, "timed out waiting for push to start");
+
+    while Instant::now() < deadline {
+        app.tick();
         if !app.push_in_flight {
             return;
         }
