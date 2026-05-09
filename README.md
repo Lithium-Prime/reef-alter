@@ -65,10 +65,10 @@ reef --ssh user@host:/path      # open /path on host
 
 ```bash
 # Run without installing
-npx @reef-tui/cli
+npx @lithium-prime/reef-alter
 
 # Or install globally
-npm install -g @reef-tui/cli
+npm install -g @lithium-prime/reef-alter
 reef
 ```
 

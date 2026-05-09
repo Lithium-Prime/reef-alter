@@ -4053,18 +4053,16 @@ impl App {
                 "staged",
             ),
             GitKeyboardFocus::StashSelectedButton => {
-                let paths = self
-                    .selected_file
-                    .as_ref()
-                    .map(|sel| vec![sel.path.clone()])
-                    .unwrap_or_default();
+                let Some(sel) = self.selected_file.as_ref() else {
+                    return;
+                };
                 self.prepare_stash_push(
                     StashPushOptions {
                         message: self.default_stash_message(),
                         include_untracked: true,
                         keep_index: false,
                         staged_only: false,
-                        paths,
+                        paths: vec![sel.path.clone()],
                     },
                     "selected",
                 )

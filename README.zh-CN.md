@@ -65,10 +65,10 @@ reef --ssh user@host:/path      # 打开远端的 /path
 
 ```bash
 # 直接运行，不装
-npx @reef-tui/cli
+npx @lithium-prime/reef-alter
 
 # 或者全局装
-npm install -g @reef-tui/cli
+npm install -g @lithium-prime/reef-alter
 reef
 ```
 

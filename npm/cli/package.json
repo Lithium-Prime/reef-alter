@@ -1,5 +1,5 @@
 {
-  "name": "@reef-tui/cli",
+  "name": "@lithium-prime/reef-alter",
   "version": "0.0.0",
   "description": "Reef — a terminal UI for Git and code review",
   "bin": {
@@ -11,21 +11,21 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Blushyes/reef.git"
+    "url": "git+https://github.com/Lithium-Prime/reef-with-multi-git-repo.git"
   },
-  "homepage": "https://github.com/Blushyes/reef#readme",
+  "homepage": "https://github.com/Lithium-Prime/reef-with-multi-git-repo#readme",
   "bugs": {
-    "url": "https://github.com/Blushyes/reef/issues"
+    "url": "https://github.com/Lithium-Prime/reef-with-multi-git-repo/issues"
   },
   "license": "MIT",
   "engines": {
     "node": ">=16"
   },
   "optionalDependencies": {
-    "@reef-tui/cli-darwin-arm64": "0.0.0",
-    "@reef-tui/cli-darwin-x64": "0.0.0",
-    "@reef-tui/cli-linux-arm64": "0.0.0",
-    "@reef-tui/cli-linux-x64": "0.0.0",
-    "@reef-tui/cli-win32-x64": "0.0.0"
+    "@lithium-prime/reef-alter-darwin-arm64": "0.0.0",
+    "@lithium-prime/reef-alter-darwin-x64": "0.0.0",
+    "@lithium-prime/reef-alter-linux-arm64": "0.0.0",
+    "@lithium-prime/reef-alter-linux-x64": "0.0.0",
+    "@lithium-prime/reef-alter-win32-x64": "0.0.0"
   }
 }

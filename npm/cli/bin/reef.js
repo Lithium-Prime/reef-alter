@@ -4,11 +4,11 @@
 const { spawnSync } = require('child_process');
 
 const PLATFORMS = {
-  'darwin-arm64': { pkg: '@reef-tui/cli-darwin-arm64', bin: 'reef' },
-  'darwin-x64':   { pkg: '@reef-tui/cli-darwin-x64',   bin: 'reef' },
-  'linux-arm64':  { pkg: '@reef-tui/cli-linux-arm64',  bin: 'reef' },
-  'linux-x64':    { pkg: '@reef-tui/cli-linux-x64',    bin: 'reef' },
-  'win32-x64':    { pkg: '@reef-tui/cli-win32-x64',    bin: 'reef.exe' },
+  'darwin-arm64': { pkg: '@lithium-prime/reef-alter-darwin-arm64', bin: 'reef' },
+  'darwin-x64':   { pkg: '@lithium-prime/reef-alter-darwin-x64',   bin: 'reef' },
+  'linux-arm64':  { pkg: '@lithium-prime/reef-alter-linux-arm64',  bin: 'reef' },
+  'linux-x64':    { pkg: '@lithium-prime/reef-alter-linux-x64',    bin: 'reef' },
+  'win32-x64':    { pkg: '@lithium-prime/reef-alter-win32-x64',    bin: 'reef.exe' },
 };
 
 const key = `${process.platform}-${process.arch}`;
@@ -26,7 +26,7 @@ try {
 } catch (_) {
   console.error(`reef: platform package ${entry.pkg} is not installed.`);
   console.error(`This usually means your package manager skipped optionalDependencies.`);
-  console.error(`Try reinstalling: npm install @reef-tui/cli`);
+  console.error(`Try reinstalling: npm install @lithium-prime/reef-alter`);
   process.exit(1);
 }
 
