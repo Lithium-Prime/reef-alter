@@ -225,28 +225,33 @@ fn max_depth_limits_discovery() {
 }
 
 #[test]
-fn nested_repos_are_suppressed_by_default() {
+fn nested_repos_are_discovered_by_default() {
     let tmp = TempDir::new().unwrap();
     init_repo(&tmp.path().join("outer"));
     init_repo(&tmp.path().join("outer/inner"));
 
     let backend = LocalBackend::open_at(tmp.path().to_path_buf());
-    let default_nested = RepoDiscoverOpts {
-        max_depth: 2,
-        include_nested: false,
-        max_repos: Some(100),
-    };
+    let default_nested = RepoDiscoverOpts::default();
     let include_nested = RepoDiscoverOpts {
         max_depth: 2,
         include_nested: true,
         max_repos: Some(100),
     };
+    let suppress_nested = RepoDiscoverOpts {
+        max_depth: 2,
+        include_nested: false,
+        max_repos: Some(100),
+    };
 
-    assert_eq!(repo_paths(&backend, &default_nested).0, vec!["outer"]);
+    assert_eq!(
+        repo_paths(&backend, &default_nested).0,
+        vec!["outer", "outer/inner"]
+    );
     assert_eq!(
         repo_paths(&backend, &include_nested).0,
         vec!["outer", "outer/inner"]
     );
+    assert_eq!(repo_paths(&backend, &suppress_nested).0, vec!["outer"]);
 }
 
 #[test]

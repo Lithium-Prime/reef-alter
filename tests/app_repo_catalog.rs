@@ -277,6 +277,21 @@ fn app_auto_selects_root_repo() {
 }
 
 #[test]
+fn app_discovers_nested_repos_inside_root_repo() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_repo(tmp.path());
+    init_repo(&tmp.path().join("tools/child"));
+
+    let mut app = app_for(tmp.path());
+    wait_for_repo_catalog(&mut app);
+
+    assert_eq!(catalog_paths(&app), vec![".", "tools/child"]);
+    assert_eq!(app.repo_catalog.selected_git_repo, None);
+}
+
+#[test]
 fn git_file_edit_path_resolves_inside_selected_child_repo() {
     let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDir::new().unwrap();

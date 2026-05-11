@@ -147,7 +147,7 @@ impl Default for RepoDiscoverOpts {
     fn default() -> Self {
         Self {
             max_depth: 2,
-            include_nested: false,
+            include_nested: true,
             max_repos: Some(100),
         }
     }
