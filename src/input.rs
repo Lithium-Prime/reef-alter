@@ -238,24 +238,32 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         return;
     }
 
-    // Space-leader chord: bare Space primes, bare `p` opens the quick-open
-    // palette, bare `f` opens the global-search palette. Bare Space has no
-    // other global meaning, so the chord doesn't collide with any existing
-    // binding. Context: we're already past the palette / search / place
-    // gates, so the leader is only in play during normal tab navigation.
-    //
-    // Exception: when a text input is focused — the Tab::Search query or
-    // the Tab::Git commit box — bare Space is a literal character the user
-    // is typing. We gate arming off so "foo bar" / "fix: the thing" just
-    // types. An empty buffer is fine to arm anyway — there's no char to
-    // accidentally swallow yet.
     let search_input_focused = app.active_tab == Tab::Search
         && app.active_panel == Panel::Files
         && app.global_search.input_focused();
     let commit_input_focused = app.active_tab == Tab::Git
         && app.active_panel == Panel::Files
         && app.git_status.commit_editing;
-    let in_input_mode = search_input_focused || commit_input_focused;
+
+    // The Git commit box owns the keyboard while editing. Known text-editing
+    // keys update the buffer; unknown Ctrl/Alt chords are swallowed here so
+    // they cannot leak into global or Git shortcuts.
+    if commit_input_focused {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        handle_key_git_commit(key, app, ctrl, alt);
+        return;
+    }
+
+    // Space-leader chord: bare Space primes, bare `p` opens the quick-open
+    // palette, bare `f` opens the global-search palette. Bare Space has no
+    // other global meaning, so the chord doesn't collide with any existing
+    // binding. Context: we're already past the palette / search / place
+    // gates, so the leader is only in play during normal tab navigation.
+    //
+    // Exception: when the Tab::Search query is focused, bare Space is a
+    // literal character the user is typing. Commit input returns above.
+    let in_input_mode = search_input_focused;
     // In Tab::Search list mode + replace_open, bare `Space` is the
     // per-match toggle — disarm the leader chord so a single tap of
     // Space doesn't ambiguously prime a chord and never resolve.
@@ -265,8 +273,6 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         && app.global_search.replace_open;
     let leader_allow_arm = if search_input_focused {
         app.global_search.query.is_empty()
-    } else if commit_input_focused {
-        app.git_status.commit_message.is_empty()
     } else {
         !search_list_replace_mode
     };
