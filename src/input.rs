@@ -1548,9 +1548,8 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
             // selected (empty status) or the repo's gone. A Deleted-status
             // file will be recreated by the editor if the user writes — same
             // behaviour you'd get running `$EDITOR path/to/deleted` in a shell.
-            if let Some(sel) = &app.selected_file {
-                let workdir = app.backend.workdir_path();
-                app.pending_edit = Some(workdir.join(&sel.path));
+            if let Some(path) = app.selected_git_file_path() {
+                app.pending_edit = Some(path);
             }
         }
         _ => {}

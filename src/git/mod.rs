@@ -14,7 +14,7 @@ pub struct StashPushOptions {
     pub paths: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StashEntry {
     pub index: usize,
     pub stash_ref: String,

@@ -277,6 +277,26 @@ fn app_auto_selects_root_repo() {
 }
 
 #[test]
+fn git_file_edit_path_resolves_inside_selected_child_repo() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_repo(&tmp.path().join("alpha"));
+
+    let mut app = app_for(tmp.path());
+    wait_for_repo_catalog(&mut app);
+    app.select_file("src/lib.rs", false);
+    app.git_status.keyboard_focus = GitKeyboardFocus::Files;
+
+    app.activate_git_keyboard_focus();
+
+    assert_eq!(
+        app.pending_edit.as_deref(),
+        Some(tmp.path().join("alpha/src/lib.rs").as_path())
+    );
+}
+
+#[test]
 fn git_status_command_selects_discovered_repo() {
     let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDir::new().unwrap();

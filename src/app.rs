@@ -3779,6 +3779,9 @@ impl App {
         self.commit_detail.detail = None;
         self.commit_detail.range_detail = None;
         self.commit_detail.file_diff = None;
+        self.diff_load.invalidate();
+        self.commit_detail_load.invalidate();
+        self.commit_file_diff_load.invalidate();
         self.stash_detail_load.invalidate();
     }
 
@@ -4086,12 +4089,22 @@ impl App {
                 }
             }
             GitKeyboardFocus::Files => {
-                if let Some(sel) = &self.selected_file {
-                    let workdir = self.backend.workdir_path();
-                    self.pending_edit = Some(workdir.join(&sel.path));
+                if let Some(path) = self.selected_git_file_path() {
+                    self.pending_edit = Some(path);
                 }
             }
         }
+    }
+
+    pub fn selected_git_file_path(&self) -> Option<PathBuf> {
+        let sel = self.selected_file.as_ref()?;
+        let repo_root_rel = self.status_repo_root_rel()?;
+        Some(
+            self.backend
+                .workdir_path()
+                .join(repo_root_rel)
+                .join(&sel.path),
+        )
     }
 
     pub fn selected_stash_ref(&self) -> Option<String> {
@@ -4836,6 +4849,8 @@ impl App {
                 Ok(payload) => {
                     if self.git_status_load.complete_ok(generation) {
                         let before = self.selected_file.clone();
+                        let previous_stashes = self.git_status.stashes.clone();
+                        let previous_selected_stash_ref = self.selected_stash_ref();
                         self.staged_files = payload.staged;
                         self.unstaged_files = payload.unstaged;
                         self.git_status.ahead_behind = payload.ahead_behind;
@@ -4865,9 +4880,21 @@ impl App {
                         if before != self.selected_file {
                             self.load_diff();
                         }
-                        if !self.git_status.stashes.is_empty() {
+                        let stashes_changed = self.git_status.stashes != previous_stashes;
+                        let selected_stash_ref_changed =
+                            self.selected_stash_ref() != previous_selected_stash_ref;
+                        if !self.git_status.stashes.is_empty()
+                            && (stashes_changed
+                                || selected_stash_ref_changed
+                                || (self.git_status.stash_detail.is_none()
+                                    && !self.stash_detail_load.loading))
+                        {
                             self.load_selected_stash_detail();
-                        } else {
+                        } else if self.git_status.stashes.is_empty()
+                            && (stashes_changed
+                                || self.git_status.stash_detail.is_some()
+                                || self.stash_detail_load.loading)
+                        {
                             self.git_status.stash_detail = None;
                             self.stash_detail_load.invalidate();
                         }
@@ -4884,9 +4911,12 @@ impl App {
                     }
                 }
                 Err(error) => {
-                    self.stash_detail_load
-                        .complete_err(generation, error.clone());
-                    self.git_status.stash_error = Some(error);
+                    if self
+                        .stash_detail_load
+                        .complete_err(generation, error.clone())
+                    {
+                        self.git_status.stash_error = Some(error);
+                    }
                 }
             },
             WorkerResult::Diff { generation, result } => match result {
