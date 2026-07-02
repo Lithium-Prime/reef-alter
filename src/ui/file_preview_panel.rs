@@ -327,7 +327,9 @@ fn binary_reason_text(info: &BinaryInfo) -> String {
 
 fn render_text(f: &mut Frame, app: &mut App, area: Rect, preview: &PreviewContent, focused: bool) {
     let (lines, highlighted) = match &preview.body {
-        PreviewBody::Text { lines, highlighted } => (lines, highlighted),
+        PreviewBody::Text {
+            lines, highlighted, ..
+        } => (lines, highlighted),
         _ => return,
     };
     let th = app.theme;

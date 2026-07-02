@@ -49,6 +49,7 @@ pub enum Msg {
     TabSearch,
     TabGit,
     TabGraph,
+    TabContainers,
     TabBarHint,
 
     // Chrome
@@ -242,6 +243,7 @@ pub enum Msg {
     PanelDiff,
     PanelSearch,
     PanelGraph,
+    PanelContainers,
 
     // Settings page
     SettingsTitle,
@@ -293,9 +295,10 @@ fn t_zh(m: Msg) -> &'static str {
         TabSearch => " 🔎 搜索 ",
         TabGit => " ⎇ Git ",
         TabGraph => " ⑂ 图表 ",
-        TabBarHint => " 1:文件 2:搜索 3:Git 4:图表",
-        StatusBarHint => " q:退出 Tab:切换 s:暂存 u:取消 r:刷新 h:帮助 ",
-        SelectModeHint => "  拖拽鼠标选择文字，按 v 退出选择模式",
+        TabContainers => " ▣ 容器 ",
+        TabBarHint => " 1:文件 2:搜索 3:Git 4:图表 5:容器",
+        StatusBarHint => " q:退出 Tab:切换 r:刷新 h:帮助 ",
+        SelectModeHint => "  拖拽鼠标选择文字，按 Alt+V 退出选择模式",
         HelpTitle => " 快捷键帮助 ",
         NoRepoTitle => "不在 git 仓库中",
         NoRepoHint => "运行 `git init` 初始化，或在 git 仓库里打开 reef。",
@@ -400,12 +403,12 @@ fn t_zh(m: Msg) -> &'static str {
         HelpGraphRangeExtend => "扩选一行提交（Graph 标签页）",
         HelpGraphRangeExtendFast => "扩选 10 行提交（Graph 标签页）",
         HelpGraphRangeClear => "退出可视模式 / 清除范围选择",
-        HelpGraphShiftExtend => "扩选（在支持 Shift 透传的终端，否则按 V 进入可视模式）",
+        HelpGraphShiftExtend => "扩选（在支持 Shift 透传的终端，否则按 Ctrl+Alt+V 进入可视模式）",
         HelpGraphShiftClick => "Shift+点击：扩选到该提交（同上，否则用可视模式）",
         HelpGraphVisualMode => "进入/退出可视模式（Graph 标签页）",
         HelpGraphVisualClick => "可视模式下点击提交 = 改变终点",
         RangeHint => "点击下方任一提交即可折叠范围回到单选",
-        StatusBarRangeHint => "↑↓/点击 扩选 · V/Esc 退出",
+        StatusBarRangeHint => "↑↓/点击 扩选 · Ctrl+Alt+V/Esc 退出",
         HelpHomeEnd => "回到行首 / 跳到行尾",
         HelpMouseHScroll => "鼠标横向滚动",
         HelpStageUnstage => "暂存 / 取消暂存（Git tab）",
@@ -436,6 +439,7 @@ fn t_zh(m: Msg) -> &'static str {
         PanelDiff => "Diff",
         PanelSearch => "搜索",
         PanelGraph => "图表",
+        PanelContainers => "容器",
         SettingsTitle => " ⚙ 设置 ",
         SettingsFooterHint => "  ↑↓ 选择 · Enter 切换/编辑 · Esc 返回",
         SettingsEditorEditHint => "  Enter 保存 · Esc 取消",
@@ -478,9 +482,10 @@ fn t_en(m: Msg) -> &'static str {
         TabSearch => " 🔎 Search ",
         TabGit => " ⎇ Git ",
         TabGraph => " ⑂ Graph ",
-        TabBarHint => " 1:Files 2:Search 3:Git 4:Graph",
-        StatusBarHint => " q:quit Tab:switch s:stage u:unstage r:refresh h:help ",
-        SelectModeHint => "  Drag to select text, press v to exit select mode",
+        TabContainers => " ▣ Containers ",
+        TabBarHint => " 1:Files 2:Search 3:Git 4:Graph 5:Containers",
+        StatusBarHint => " q:quit Tab:switch r:refresh h:help ",
+        SelectModeHint => "  Drag to select text, press Alt+V to exit select mode",
         HelpTitle => " Keybindings ",
         NoRepoTitle => "Not a git repository",
         NoRepoHint => "Run `git init` to initialise one, or open reef inside a git repo.",
@@ -585,12 +590,12 @@ fn t_en(m: Msg) -> &'static str {
         HelpGraphRangeExtend => "Extend commit range by 1 (Graph tab)",
         HelpGraphRangeExtendFast => "Extend commit range by 10 (Graph tab)",
         HelpGraphRangeClear => "Exit visual mode / clear range",
-        HelpGraphShiftExtend => "Extend range (terminals that forward Shift; else use V)",
+        HelpGraphShiftExtend => "Extend range (terminals that forward Shift; else use Ctrl+Alt+V)",
         HelpGraphShiftClick => "Shift+Click: extend range (same; else use visual mode)",
         HelpGraphVisualMode => "Enter/exit visual mode (Graph tab)",
         HelpGraphVisualClick => "In visual mode: click = move endpoint",
         RangeHint => "Click any commit below to collapse back to single-select",
-        StatusBarRangeHint => "↑↓/click extend · V/Esc exit",
+        StatusBarRangeHint => "↑↓/click extend · Ctrl+Alt+V/Esc exit",
         HelpHomeEnd => "Jump to line start / end",
         HelpMouseHScroll => "Mouse horizontal scroll",
         HelpStageUnstage => "Stage / unstage (Git tab)",
@@ -621,6 +626,7 @@ fn t_en(m: Msg) -> &'static str {
         PanelDiff => "Diff",
         PanelSearch => "Search",
         PanelGraph => "Graph",
+        PanelContainers => "Containers",
         SettingsTitle => " ⚙ Settings ",
         SettingsFooterHint => "  ↑↓ select · Enter toggle/edit · Esc back",
         SettingsEditorEditHint => "  Enter save · Esc cancel",
@@ -762,6 +768,13 @@ pub fn branch_create_menu_item() -> String {
     }
 }
 
+pub fn branch_merge_menu_item() -> String {
+    match lang() {
+        Lang::Zh => "合并".to_string(),
+        Lang::En => "Merge".to_string(),
+    }
+}
+
 pub fn branch_create_title() -> String {
     match lang() {
         Lang::Zh => "创建分支".to_string(),
@@ -841,6 +854,79 @@ pub fn branch_created_toast(branch: &str) -> String {
     match lang() {
         Lang::Zh => format!("已创建并切换到 {branch}"),
         Lang::En => format!("Created and switched to {branch}"),
+    }
+}
+
+pub fn branch_merged_toast(branch: &str) -> String {
+    match lang() {
+        Lang::Zh => format!("已合并 {branch}"),
+        Lang::En => format!("Merged {branch}"),
+    }
+}
+
+pub fn branch_merge_failed_toast(e: &str) -> String {
+    let first = e
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or(e);
+    match lang() {
+        Lang::Zh => format!("合并失败: {first}"),
+        Lang::En => format!("Merge failed: {first}"),
+    }
+}
+
+pub fn branch_merge_thread_crashed() -> String {
+    match lang() {
+        Lang::Zh => "合并任务崩溃".to_string(),
+        Lang::En => "Merge thread crashed".to_string(),
+    }
+}
+
+pub fn containers_title(count: usize) -> String {
+    match lang() {
+        Lang::Zh => format!(" 容器 ({count}) "),
+        Lang::En => format!(" Containers ({count}) "),
+    }
+}
+
+pub fn containers_empty() -> String {
+    match lang() {
+        Lang::Zh => "未发现容器".to_string(),
+        Lang::En => "No containers found".to_string(),
+    }
+}
+
+pub fn containers_error(error: &str) -> String {
+    match lang() {
+        Lang::Zh => format!("容器加载失败: {error}"),
+        Lang::En => format!("Container load failed: {error}"),
+    }
+}
+
+pub fn container_action_success(action: &str, name: &str) -> String {
+    match lang() {
+        Lang::Zh => format!("容器 {name} 已执行 {action}"),
+        Lang::En => format!("Container {name} {action} succeeded"),
+    }
+}
+
+pub fn container_action_failed(action: &str, e: &str) -> String {
+    let first = e
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or(e);
+    match lang() {
+        Lang::Zh => format!("容器 {action} 失败: {first}"),
+        Lang::En => format!("Container {action} failed: {first}"),
+    }
+}
+
+pub fn container_action_thread_crashed() -> String {
+    match lang() {
+        Lang::Zh => "容器操作线程异常退出，请重试".to_string(),
+        Lang::En => "Container worker crashed, please retry".to_string(),
     }
 }
 
@@ -963,8 +1049,8 @@ pub fn place_mode_copy_failed(e: &str) -> String {
 /// the user with no way to click a target.
 pub fn place_mode_blocked_by_select_mode() -> String {
     match lang() {
-        Lang::Zh => "拖拽被选择模式拦住了：按 v 退出选择模式后再试".to_string(),
-        Lang::En => "Drop blocked by select mode — press v to exit, then retry".to_string(),
+        Lang::Zh => "拖拽被选择模式拦住了：按 Alt+V 退出选择模式后再试".to_string(),
+        Lang::En => "Drop blocked by select mode — press Alt+V to exit, then retry".to_string(),
     }
 }
 

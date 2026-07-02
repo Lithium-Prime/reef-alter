@@ -1,4 +1,5 @@
 pub mod commit_detail_panel;
+pub mod containers_panel;
 pub mod context_menu_panel;
 pub mod db_preview;
 pub mod diff_panel;
@@ -190,6 +191,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
             }
             let focused = matches!(app.active_panel, crate::app::Panel::Diff);
             file_preview_panel::render(f, app, body_layout[editor_idx], focused);
+        }
+        Tab::Containers => {
+            if has_sidebar {
+                containers_panel::render_list(f, app, body_layout[0]);
+            }
+            containers_panel::render_detail(f, app, body_layout[editor_idx]);
         }
     }
 
@@ -754,6 +761,8 @@ fn panel_chip_text(tab: crate::app::Tab, panel: crate::app::Panel) -> &'static s
         (Tab::Graph, Panel::Files) => t(Msg::PanelGraph),
         (Tab::Graph, Panel::Commit) => t(Msg::PanelCommit),
         (Tab::Graph, Panel::Diff) => t(Msg::PanelDiff),
+        (Tab::Containers, Panel::Files) => t(Msg::PanelContainers),
+        (Tab::Containers, Panel::Diff | Panel::Commit) => t(Msg::PanelPreview),
     }
 }
 
@@ -854,7 +863,7 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         ("PageDown", t(Msg::HelpPageDown)),
         ("← / →", t(Msg::HelpHScroll)),
         ("Shift+← / Shift+→", t(Msg::HelpHScrollFast)),
-        ("V", t(Msg::HelpGraphVisualMode)),
+        ("Ctrl+Alt+V", t(Msg::HelpGraphVisualMode)),
         ("↑ / ↓ (visual)", t(Msg::HelpGraphRangeExtend)),
         ("PgUp / PgDn (visual)", t(Msg::HelpGraphRangeExtendFast)),
         ("Click (visual)", t(Msg::HelpGraphVisualClick)),
@@ -869,7 +878,7 @@ fn render_help(f: &mut Frame, app: &App, screen: Rect) {
         ("f", t(Msg::HelpDiffMode)),
         ("t", t(Msg::HelpToggleView)),
         ("r", t(Msg::HelpRefresh)),
-        ("v", t(Msg::HelpSelectMode)),
+        ("Alt+V", t(Msg::HelpSelectMode)),
         ("h", t(Msg::HelpShowHelp)),
         ("Ctrl+B", t(Msg::HelpToggleSidebar)),
         ("Ctrl+,", t(Msg::HelpOpenSettings)),

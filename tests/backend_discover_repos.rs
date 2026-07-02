@@ -652,6 +652,43 @@ fn create_branch_for_child_repo_remote_matches_local() {
 }
 
 #[test]
+fn merge_branch_for_child_repo_remote_matches_local() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    for repo_name in ["alpha", "beta"] {
+        let repo_path = tmp.path().join(repo_name);
+        init_repo(&repo_path);
+        write_file(&repo_path.join("base.txt"), "base\n");
+        commit_all(&repo_path, "base");
+        create_branch(&repo_path, "feature");
+        git_ok(&repo_path, &["checkout", "feature"]);
+        write_file(&repo_path.join("feature.txt"), "feature\n");
+        commit_all(&repo_path, "feature");
+        git_ok(&repo_path, &["checkout", "master"]);
+    }
+
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    local
+        .merge_branch_for(Path::new("alpha"), "feature")
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("alpha/feature.txt")).unwrap(),
+        "feature\n"
+    );
+
+    let remote = spawn_remote(tmp.path());
+    remote
+        .merge_branch_for(Path::new("beta"), "feature")
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("beta/feature.txt")).unwrap(),
+        "feature\n"
+    );
+    assert!(git2::Repository::open(tmp.path()).unwrap().head().is_err());
+}
+
+#[test]
 fn publish_branch_for_child_repo_remote_matches_local() {
     let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDir::new().unwrap();

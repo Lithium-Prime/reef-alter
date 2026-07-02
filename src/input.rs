@@ -2,7 +2,7 @@
 //! event-drain loop to `handle_key` and `handle_mouse` here, so the binary
 //! entry point stays focused on terminal bootstrap.
 //!
-//! The one exception is the `v` (select mode toggle) and `show_help`
+//! The one exception is the `Alt+V` (select mode toggle) and `show_help`
 //! dismiss — those stay inline in `main.rs` because the first needs
 //! `execute!(terminal.backend_mut(), ...)` to flip crossterm's mouse
 //! capture mode, and both are simple enough that splitting them out would
@@ -508,6 +508,28 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         Tab::Files => handle_key_files(key, app),
         Tab::Search => handle_key_search(key, app),
         Tab::Graph => handle_key_graph(key, app),
+        Tab::Containers => handle_key_containers(key, app),
+    }
+}
+
+fn handle_key_containers(key: KeyEvent, app: &mut App) {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => app.move_container_selection(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.move_container_selection(1),
+        KeyCode::PageUp => app.move_container_selection(-10),
+        KeyCode::PageDown => app.move_container_selection(10),
+        KeyCode::Home => app.select_container(0),
+        KeyCode::End => {
+            let last = app.containers.containers.len().saturating_sub(1);
+            app.select_container(last);
+        }
+        KeyCode::Char('r') => {
+            app.containers_load.mark_stale();
+        }
+        KeyCode::Char('s') => app.run_container_action(crate::backend::ContainerAction::Start),
+        KeyCode::Char('x') => app.run_container_action(crate::backend::ContainerAction::Stop),
+        KeyCode::Char('R') => app.run_container_action(crate::backend::ContainerAction::Restart),
+        _ => {}
     }
 }
 
@@ -1141,11 +1163,12 @@ fn graph_scroll_right_panel(app: &mut App, delta: i32) {
 fn handle_key_graph(key: KeyEvent, app: &mut App) {
     use ui::{commit_detail_panel, git_graph_panel};
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     // While in visual mode every direction key extends (no Shift needed —
     // works in terminals that intercept Shift+Click / Shift+Arrow for text
-    // selection), a mouse click on a commit moves the endpoint, and `V` /
-    // `Esc` exits. This is the primary path; Shift+Arrow below is kept as
+    // selection), a mouse click on a commit moves the endpoint, and
+    // Ctrl+Alt+V / Esc exits. This is the primary path; Shift+Arrow below is kept as
     // a convenience for terminals that *do* forward the modifier.
     let in_visual = app.git_graph.in_visual_mode() && app.active_panel == Panel::Files;
     match key.code {
@@ -1221,11 +1244,11 @@ fn handle_key_graph(key: KeyEvent, app: &mut App) {
                 graph_scroll_right_panel(app, 20);
             }
         }
-        // `V` (uppercase = Shift+v) toggles visual mode. Entering: anchor
+        // Ctrl+Alt+V toggles visual mode. Entering: anchor
         // collapses onto the cursor (is_range() stays false until the user
         // actually extends), so the status bar can distinguish "armed but
         // empty" from an active range if it wants to.
-        KeyCode::Char('V') if app.active_panel == Panel::Files => {
+        KeyCode::Char('v' | 'V') if app.active_panel == Panel::Files && ctrl && alt => {
             if app.git_graph.in_visual_mode() {
                 app.clear_graph_range();
             } else if !app.git_graph.rows.is_empty() {
@@ -2330,7 +2353,7 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                 // Shift+Click on a graph row = extend the range, for
                 // terminals that actually forward Shift+Click to the app.
                 // Most macOS terminals intercept this for text selection;
-                // those users should press `V` to enter visual mode and
+                // those users should press Ctrl+Alt+V to enter visual mode and
                 // click normally instead — the in-visual-mode click path
                 // lives in `git_graph_panel::handle_command`.
                 if mouse.modifiers.contains(KeyModifiers::SHIFT)
@@ -2517,6 +2540,11 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                         app.preview_scroll = app.preview_scroll.saturating_sub(3);
                     }
                 }
+                Tab::Containers => {
+                    if is_left {
+                        app.move_container_selection(-3);
+                    }
+                }
             }
         }
         MouseEventKind::ScrollDown => {
@@ -2563,6 +2591,11 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                         global_search::move_selection_by(app, 3);
                     } else {
                         app.preview_scroll += 3;
+                    }
+                }
+                Tab::Containers => {
+                    if is_left {
+                        app.move_container_selection(3);
                     }
                 }
             }
@@ -3025,6 +3058,7 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
             }
         },
         (Tab::Search, false) => Some(&mut app.preview_h_scroll),
+        (Tab::Containers, false) => None,
         (Tab::Graph, false) => {
             // In 3-col mode the right portion is [commit | diff]; figure
             // out which column the cursor sits over so h_scroll targets

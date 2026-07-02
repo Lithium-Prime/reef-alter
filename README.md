@@ -23,7 +23,7 @@ No autocomplete. No linter. No language server. Not even a text editor. Write wi
 - **Files** — tree navigator with a read-only preview: syntax-highlighted code, inline image rendering (Kitty / iTerm2 / halfblocks, auto-detected), and friendly metadata cards for binaries.
 - **Search** — workdir-wide content search (ripgrep-powered, honours `.gitignore`) with live preview on the right; modal list / input modes, whole-row horizontal scroll, 1000-hit cap.
 - **Git** — status with per-file `+N −M` numstat; stage / unstage per file **or per folder** (keyboard or double-click); unified or side-by-side diff; compact or full-file context; syntax-highlighted; discard (confirmed) and discard-all; push / force-push (`--force-with-lease`) behind a confirm banner.
-- **Graph** — commit DAG with ref chips, inline commit detail and per-file diff. Vim-style visual mode (`V`) selects a range of commits and renders the merged diff across them; `Shift+↑/↓` or `Shift+Click` extends the range without entering visual mode.
+- **Graph** — commit DAG with ref chips, inline commit detail and per-file diff. Visual mode (`Ctrl+Alt+V`) selects a range of commits and renders the merged diff across them; `Shift+↑/↓` or `Shift+Click` extends the range without entering visual mode.
 
 ### Palettes & overlays
 
@@ -55,7 +55,7 @@ reef --ssh user@host:/path      # open /path on host
 - **Keyboard first**, mouse where it earns its keep — drag to resize the split, double-click to toggle staging, scroll the panel under the cursor, right-click the tree for a context menu.
 - **Vim-style in-panel search** — `/` and `?` open a prompt, `n` / `N` step matches, with `Alt`/`Ctrl` word-editing shortcuts in the prompt.
 - **Navigation**: `↑` / `↓`, `j` / `k`, and `Ctrl+P` / `Ctrl+N` / `Ctrl+K` / `Ctrl+J` all move the selection on every tab.
-- **Selection & clipboard** — `v` toggles mouse capture so the terminal's native text selection works; or drag inside a preview pane and Reef copies to the system clipboard via OSC 52 (no helper binary, works over SSH).
+- **Selection & clipboard** — `Alt+V` toggles mouse capture so the terminal's native text selection works; or drag inside a preview pane and Reef copies to the system clipboard via OSC 52 (no helper binary, works over SSH).
 - **Auto-themes** — OSC 11 probe picks up terminal light/dark mode; locale auto-detects (English / 简体中文).
 - **Persistent prefs** — diff layout, diff mode, recent SSH hosts, and friends survive restarts.
 
@@ -101,7 +101,7 @@ Reef works anywhere. Outside a git repo, the Git and Graph tabs show a "Not a gi
 | `Space p` | quick-open file (fuzzy path) |
 | `Space f` | global content search overlay |
 | `Ctrl+O` | hosts picker (open SSH target) |
-| `v` | toggle mouse capture (for terminal text selection) |
+| `Alt+V` | toggle mouse capture (for terminal text selection) |
 | `↑` / `↓`, `j` / `k`, `Ctrl+P` / `Ctrl+N` | navigate |
 | `Ctrl+K` / `Ctrl+J` | navigate (alt) |
 | `PgUp` / `PgDn` | page |
@@ -151,7 +151,7 @@ Left panel is modal. List mode is the default: global shortcuts (`h`, `q`, digit
 | Key | Action |
 | --- | --- |
 | `↑` / `↓`, `j` / `k` | move commit selection |
-| `V` | enter visual mode (select commit range) |
+| `Ctrl+Alt+V` | enter visual mode (select commit range) |
 | `↑` / `↓` or `PgUp` / `PgDn` (visual) | extend range |
 | `Shift+↑` / `Shift+↓`, `Shift+Click` | extend range without visual mode |
 | click in range (visual) | set the other end |

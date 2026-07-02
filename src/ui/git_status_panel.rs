@@ -313,6 +313,17 @@ pub fn handle_command(app: &mut App, id: &str, args: &Value) -> bool {
             }
             true
         }
+        "git.mergeBranch" => {
+            if !can_perform_git_writes(app) || app.merge_in_flight {
+                return true;
+            }
+            let branch = args.get("branch").and_then(|v| v.as_str()).unwrap_or("");
+            if !branch.is_empty() {
+                app.git_status.branch_dropdown_open = false;
+                app.run_merge_branch(branch);
+            }
+            true
+        }
         "git.toggleBranchDropdown" => {
             app.git_status.keyboard_focus = GitKeyboardFocus::Branch;
             app.git_status.branch_dropdown_open = !app.git_status.branch_dropdown_open;
@@ -1549,28 +1560,62 @@ fn push_branch_selector(rows: &mut Vec<Row>, app: &App, max_path: usize, theme: 
         );
         for (idx, branch) in branches.into_iter().enumerate() {
             let branch_bg = (focused && selected_idx == idx + 1).then_some(theme.selection_bg);
+            let can_merge = !app.merge_in_flight && branch != app.branch_name;
+            let merge_label = crate::i18n::branch_merge_menu_item();
+            let merge_width = if can_merge {
+                merge_label.width().saturating_add(4)
+            } else {
+                0
+            };
             let mut label = branch.clone();
-            truncate_in_place(&mut label, max_path.saturating_sub(2).max(1));
+            truncate_in_place(
+                &mut label,
+                max_path.saturating_sub(2 + merge_width).max(1),
+            );
+            let label_width = label.width();
+            let padding = max_path
+                .saturating_sub(2 + merge_width + label_width)
+                .max(1);
+            let mut spans = vec![
+                RowSpan::styled(
+                    " ".repeat(branch_prefix_width),
+                    apply_bg(Style::default(), branch_bg),
+                ),
+                RowSpan::styled(
+                    "› ",
+                    apply_bg(Style::default().fg(theme.fg_secondary), branch_bg),
+                ),
+                RowSpan::styled(
+                    label,
+                    apply_bg(
+                        Style::default()
+                            .fg(theme.fg_primary)
+                            .add_modifier(Modifier::BOLD),
+                        branch_bg,
+                    ),
+                ),
+                RowSpan::styled(" ".repeat(padding), apply_bg(Style::default(), branch_bg)),
+            ];
+            if can_merge {
+                spans.push(RowSpan::styled(" ", apply_bg(Style::default(), branch_bg)));
+                spans.push(RowSpan {
+                    text: format!(" {merge_label} "),
+                    style: apply_bg(
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD),
+                        branch_bg,
+                    ),
+                    click: Some((
+                        "git.mergeBranch".to_string(),
+                        serde_json::json!({ "branch": branch }),
+                    )),
+                    dbl: None,
+                });
+                spans.push(RowSpan::styled(" ", apply_bg(Style::default(), branch_bg)));
+            }
             rows.push(
-                Row::new(vec![
-                    RowSpan::styled(
-                        " ".repeat(branch_prefix_width),
-                        apply_bg(Style::default(), branch_bg),
-                    ),
-                    RowSpan::styled(
-                        "› ",
-                        apply_bg(Style::default().fg(theme.fg_secondary), branch_bg),
-                    ),
-                    RowSpan::styled(
-                        label,
-                        apply_bg(
-                            Style::default()
-                                .fg(theme.fg_primary)
-                                .add_modifier(Modifier::BOLD),
-                            branch_bg,
-                        ),
-                    ),
-                ])
+                Row::new(spans)
                 .on_click(
                     "git.checkoutBranch",
                     serde_json::json!({ "branch": branch }),

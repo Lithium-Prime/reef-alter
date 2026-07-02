@@ -31,6 +31,7 @@ pub enum PreviewBody {
     Text {
         lines: Vec<String>,
         highlighted: Option<Vec<Vec<(ratatui::style::Style, String)>>>,
+        source_bytes: usize,
     },
     Image(ImagePreview),
     Binary(BinaryInfo),
@@ -54,6 +55,37 @@ impl PreviewContent {
     /// pagination flow vs the standard text-scroll flow.
     pub fn is_database(&self) -> bool {
         matches!(self.body, PreviewBody::Database(_))
+    }
+
+    pub fn memory_weight_bytes(&self) -> usize {
+        self.file_path.len() + self.body.memory_weight_bytes()
+    }
+}
+
+impl PreviewBody {
+    fn memory_weight_bytes(&self) -> usize {
+        match self {
+            PreviewBody::Text {
+                lines,
+                highlighted,
+                ..
+            } => {
+                let line_bytes = lines.iter().map(|line| line.len()).sum::<usize>();
+                let highlight_bytes = highlighted
+                    .as_ref()
+                    .map(|rows| {
+                        rows.iter()
+                            .flat_map(|row| row.iter())
+                            .map(|(_, token)| token.len())
+                            .sum::<usize>()
+                    })
+                    .unwrap_or(0);
+                line_bytes + highlight_bytes
+            }
+            PreviewBody::Image(img) => img.memory_weight_bytes(),
+            PreviewBody::Binary(info) => info.memory_weight_bytes(),
+            PreviewBody::Database(info) => database_memory_weight_bytes(info),
+        }
     }
 }
 
@@ -274,6 +306,16 @@ impl BinaryInfo {
             meta_line: binary_meta_line(mime, bytes_on_disk),
         }
     }
+
+    fn memory_weight_bytes(&self) -> usize {
+        self.meta_line.len()
+            + self.mime.map(|mime| mime.len()).unwrap_or(0)
+            + match &self.reason {
+                BinaryReason::DecodeError(msg) => msg.len(),
+                _ => 0,
+            }
+            + std::mem::size_of::<Self>()
+    }
 }
 
 impl ImagePreview {
@@ -318,6 +360,44 @@ impl ImagePreview {
             animated,
             meta_line: image_meta_line(width_px, height_px, format, bytes_on_disk, animated),
         }
+    }
+
+    fn memory_weight_bytes(&self) -> usize {
+        let pixel_bytes = self
+            .image
+            .as_ref()
+            .map(|image| image.as_bytes().len())
+            .unwrap_or(0);
+        pixel_bytes + self.meta_line.len() + std::mem::size_of::<Self>()
+    }
+}
+
+fn database_memory_weight_bytes(info: &reef_sqlite_preview::DatabaseInfo) -> usize {
+    let table_bytes = info
+        .tables
+        .iter()
+        .map(|table| table.name.len() + std::mem::size_of_val(table))
+        .sum::<usize>();
+    table_bytes + db_page_memory_weight_bytes(&info.initial_page) + std::mem::size_of_val(info)
+}
+
+fn db_page_memory_weight_bytes(page: &reef_sqlite_preview::DbPage) -> usize {
+    let row_bytes = page
+        .rows
+        .iter()
+        .flat_map(|row| row.iter())
+        .map(sqlite_value_memory_weight_bytes)
+        .sum::<usize>();
+    row_bytes + std::mem::size_of_val(page)
+}
+
+fn sqlite_value_memory_weight_bytes(value: &reef_sqlite_preview::SqliteValue) -> usize {
+    match value {
+        reef_sqlite_preview::SqliteValue::Null => 0,
+        reef_sqlite_preview::SqliteValue::Integer(_) => std::mem::size_of::<i64>(),
+        reef_sqlite_preview::SqliteValue::Real(_) => std::mem::size_of::<f64>(),
+        reef_sqlite_preview::SqliteValue::Text { value, .. } => value.len(),
+        reef_sqlite_preview::SqliteValue::Blob { len } => *len,
     }
 }
 
@@ -769,15 +849,15 @@ pub fn load_preview(
         lines
     };
 
-    let highlighted = if raw.len() <= 512 * 1024 && lines.len() <= 5_000 {
-        crate::ui::highlight::highlight_file(&rel_str, &lines, dark)
-    } else {
-        None
-    };
+    let _ = dark;
 
     Some(PreviewContent {
         file_path: rel_str,
-        body: PreviewBody::Text { lines, highlighted },
+        body: PreviewBody::Text {
+            lines,
+            highlighted: None,
+            source_bytes: raw.len(),
+        },
     })
 }
 

@@ -1048,6 +1048,22 @@ pub fn pull_at(workdir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Merge an existing local branch into the current branch. Uses `--no-edit`
+/// so a non-fast-forward merge never opens an editor inside the TUI.
+pub fn merge_branch_at(workdir: &Path, branch: &str) -> Result<(), String> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        return Err("empty branch name".to_string());
+    }
+    if branch.starts_with('-') || branch.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err("invalid branch name".to_string());
+    }
+    let repo = Repository::discover(workdir).map_err(|e| e.message().to_string())?;
+    repo.find_branch(branch, git2::BranchType::Local)
+        .map_err(|_| format!("branch not found: {branch}"))?;
+    run_git_command(workdir, &["merge", "--no-edit", branch]).map(|_| ())
+}
+
 /// Commit the staged index at `workdir` with `message`. Shells out to
 /// `git commit -F -` (message via stdin) for the same reason `push_at`
 /// does: respects the user's pre-commit / commit-msg hooks, GPG signing

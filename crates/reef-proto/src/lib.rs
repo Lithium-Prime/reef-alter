@@ -82,7 +82,9 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 /// - v18: adds repo-scoped branch creation.
 /// - v19: adds repo-scoped branch publishing.
 /// - v20: adds repo-scoped stash operations.
-pub const PROTOCOL_VERSION: u32 = 20;
+/// - v21: adds repo-scoped branch merge.
+/// - v22: adds container listing and start/stop/restart actions.
+pub const PROTOCOL_VERSION: u32 = 22;
 
 /// Encode a single envelope-level value to `writer` using the
 /// length-prefixed framing. The caller is expected to flush.
@@ -184,6 +186,13 @@ pub enum Request {
         opts: RepoDiscoverOptsDto,
     },
 
+    // ── Containers ────
+    ListContainers,
+    ContainerAction {
+        id: String,
+        action: ContainerActionDto,
+    },
+
     // ── Git: status / diff ────
     GitStatus,
     GitStatusFor {
@@ -279,6 +288,13 @@ pub enum Request {
         repo_root_rel: String,
         branch: String,
         base: Option<String>,
+    },
+    MergeBranch {
+        branch: String,
+    },
+    MergeBranchFor {
+        repo_root_rel: String,
+        branch: String,
     },
 
     ListStashes,
@@ -741,6 +757,38 @@ pub struct FileEntryDto {
     pub additions: u32,
     #[serde(default)]
     pub deletions: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerInfoDto {
+    pub id: String,
+    pub image: String,
+    pub command: String,
+    pub created: String,
+    pub status: String,
+    pub names: String,
+    pub ports: String,
+    pub state: ContainerStateDto,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerStateDto {
+    Running,
+    Exited,
+    Paused,
+    Restarting,
+    Created,
+    Dead,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerActionDto {
+    Start,
+    Stop,
+    Restart,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

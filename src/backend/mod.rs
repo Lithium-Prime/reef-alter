@@ -36,6 +36,76 @@ pub mod remote;
 pub use local::LocalBackend;
 pub use remote::RemoteBackend;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerInfo {
+    pub id: String,
+    pub image: String,
+    pub command: String,
+    pub created: String,
+    pub status: String,
+    pub names: String,
+    pub ports: String,
+    pub state: ContainerState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerState {
+    Running,
+    Exited,
+    Paused,
+    Restarting,
+    Created,
+    Dead,
+    Other,
+}
+
+impl ContainerState {
+    pub fn from_docker_state(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "running" => Self::Running,
+            "exited" => Self::Exited,
+            "paused" => Self::Paused,
+            "restarting" => Self::Restarting,
+            "created" => Self::Created,
+            "dead" => Self::Dead,
+            _ => Self::Other,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Exited => "exited",
+            Self::Paused => "paused",
+            Self::Restarting => "restarting",
+            Self::Created => "created",
+            Self::Dead => "dead",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl ContainerAction {
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.command()
+    }
+}
+
 /// Errors returned by `Backend` operations. Kept deliberately simple — we
 /// fold git2/IO errors into strings at the boundary because the UI only
 /// shows them as toasts / status messages.
@@ -341,6 +411,10 @@ pub trait Backend: Send + Sync {
     fn discover_repos(&self, opts: &RepoDiscoverOpts)
     -> Result<RepoDiscoverResponse, BackendError>;
 
+    // ─── containers ────────────────────────────────────────────────────────
+    fn list_containers(&self) -> Result<Vec<ContainerInfo>, BackendError>;
+    fn container_action(&self, id: &str, action: ContainerAction) -> Result<(), BackendError>;
+
     // ─── filesystem ─────────────────────────────────────────────────────────
     /// Build the flat tree of entries for the backend's workdir. `expanded`
     /// is the set of directory paths (relative) the UI wants to show as
@@ -467,6 +541,8 @@ pub trait Backend: Send + Sync {
         branch: &str,
         base: Option<&str>,
     ) -> Result<(), BackendError>;
+    fn merge_branch(&self, branch: &str) -> Result<(), BackendError>;
+    fn merge_branch_for(&self, repo_root_rel: &Path, branch: &str) -> Result<(), BackendError>;
     fn list_stashes(&self) -> Result<Vec<StashEntry>, BackendError>;
     fn list_stashes_for(&self, repo_root_rel: &Path) -> Result<Vec<StashEntry>, BackendError>;
     fn stash_detail(&self, stash_ref: &str) -> Result<StashDetail, BackendError>;

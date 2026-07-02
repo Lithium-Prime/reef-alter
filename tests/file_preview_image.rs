@@ -35,6 +35,18 @@ fn wait_for_preview(app: &mut App) {
     panic!("timed out waiting for preview worker");
 }
 
+fn wait_for_image_protocol(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        app.tick();
+        if app.preview_image_protocol.is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for image protocol");
+}
+
 #[test]
 fn selecting_png_decodes_and_builds_protocol() {
     let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -66,6 +78,7 @@ fn selecting_png_decodes_and_builds_protocol() {
     app.file_tree.selected = idx;
     app.load_preview();
     wait_for_preview(&mut app);
+    wait_for_image_protocol(&mut app);
 
     let preview = app.preview_content.as_ref().expect("preview present");
     match &preview.body {
@@ -129,6 +142,7 @@ fn re_selecting_same_image_reuses_protocol() {
     app.file_tree.selected = idx;
     app.load_preview();
     wait_for_preview(&mut app);
+    wait_for_image_protocol(&mut app);
     assert!(app.preview_image_protocol.is_some());
     assert_eq!(
         app.preview_image_protocol_builds, 1,
@@ -141,6 +155,7 @@ fn re_selecting_same_image_reuses_protocol() {
     // keep the existing protocol.
     app.load_preview();
     wait_for_preview(&mut app);
+    wait_for_image_protocol(&mut app);
     assert!(app.preview_image_protocol.is_some());
     assert_eq!(
         app.preview_image_protocol_builds, 1,

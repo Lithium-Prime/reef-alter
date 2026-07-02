@@ -18,15 +18,17 @@ use std::thread;
 use std::time::Duration;
 
 use reef_proto::{
-    ContentSearchCompletedDto, ContentSearchRequestDto, DatabaseInfoDto, DirEntryDto, Envelope,
-    MatchHitDto, Notification, ReadFileResponse, RepoDiscoverOptsDto, RepoDiscoverResponseDto,
-    Request, Response, TrashResponseDto, WalkOptsDto, WalkResponseDto, decode_frame, encode_frame,
+    ContainerActionDto, ContainerInfoDto, ContainerStateDto, ContentSearchCompletedDto,
+    ContentSearchRequestDto, DatabaseInfoDto, DirEntryDto, Envelope, MatchHitDto, Notification,
+    ReadFileResponse, RepoDiscoverOptsDto, RepoDiscoverResponseDto, Request, Response,
+    TrashResponseDto, WalkOptsDto, WalkResponseDto, decode_frame, encode_frame,
 };
 
 use super::{
-    Backend, BackendError, ContentMatchHit, ContentSearchCompleted, ContentSearchRequest,
-    EditorLaunchSpec, RepoDiscoverOpts, RepoDiscoverResponse, SearchChunkSink, StatusSnapshot,
-    TrashOutcome, WalkOpts, WalkResponse, WorkspaceRepoMeta, normalize_repo_root_rel, repo_key,
+    Backend, BackendError, ContainerAction, ContainerInfo, ContainerState, ContentMatchHit,
+    ContentSearchCompleted, ContentSearchRequest, EditorLaunchSpec, RepoDiscoverOpts,
+    RepoDiscoverResponse, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
+    WorkspaceRepoMeta, normalize_repo_root_rel, repo_key,
 };
 use crate::file_tree::{PreviewContent, TreeEntry};
 use crate::git::{
@@ -497,6 +499,19 @@ impl Backend for RemoteBackend {
         })
     }
 
+    fn list_containers(&self) -> Result<Vec<ContainerInfo>, BackendError> {
+        let resp: Vec<ContainerInfoDto> = self.request(Request::ListContainers)?;
+        Ok(resp.into_iter().map(container_info_from_dto).collect())
+    }
+
+    fn container_action(&self, id: &str, action: ContainerAction) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request(Request::ContainerAction {
+            id: id.to_string(),
+            action: container_action_to_dto(action),
+        })?;
+        Ok(())
+    }
+
     fn build_file_tree(
         &self,
         expanded: &HashSet<PathBuf>,
@@ -580,15 +595,15 @@ impl Backend for RemoteBackend {
             lines
         };
 
-        let highlighted = if raw.len() <= 512 * 1024 && lines.len() <= 5_000 {
-            crate::ui::highlight::highlight_file(&rel_str, &lines, dark)
-        } else {
-            None
-        };
+        let _ = dark;
 
         Some(PreviewContent {
             file_path: rel_str,
-            body: PreviewBody::Text { lines, highlighted },
+            body: PreviewBody::Text {
+                lines,
+                highlighted: None,
+                source_bytes: raw.len(),
+            },
         })
     }
 
@@ -894,6 +909,25 @@ impl Backend for RemoteBackend {
             repo_root_rel: repo_key(&repo_root_rel),
             branch: branch.to_string(),
             base: base.map(str::to_string),
+        })?;
+        Ok(())
+    }
+
+    fn merge_branch(&self, branch: &str) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request(Request::MergeBranch {
+            branch: branch.to_string(),
+        })?;
+        Ok(())
+    }
+
+    fn merge_branch_for(&self, repo_root_rel: &Path, branch: &str) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.merge_branch(branch);
+        }
+        let _: serde_json::Value = self.request(Request::MergeBranchFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+            branch: branch.to_string(),
         })?;
         Ok(())
     }
@@ -1670,6 +1704,39 @@ impl From<reef_proto::FileEntryDto> for FileEntry {
             additions: v.additions,
             deletions: v.deletions,
         }
+    }
+}
+
+fn container_info_from_dto(v: ContainerInfoDto) -> ContainerInfo {
+    ContainerInfo {
+        id: v.id,
+        image: v.image,
+        command: v.command,
+        created: v.created,
+        status: v.status,
+        names: v.names,
+        ports: v.ports,
+        state: container_state_from_dto(v.state),
+    }
+}
+
+fn container_state_from_dto(v: ContainerStateDto) -> ContainerState {
+    match v {
+        ContainerStateDto::Running => ContainerState::Running,
+        ContainerStateDto::Exited => ContainerState::Exited,
+        ContainerStateDto::Paused => ContainerState::Paused,
+        ContainerStateDto::Restarting => ContainerState::Restarting,
+        ContainerStateDto::Created => ContainerState::Created,
+        ContainerStateDto::Dead => ContainerState::Dead,
+        ContainerStateDto::Other => ContainerState::Other,
+    }
+}
+
+fn container_action_to_dto(v: ContainerAction) -> ContainerActionDto {
+    match v {
+        ContainerAction::Start => ContainerActionDto::Start,
+        ContainerAction::Stop => ContainerActionDto::Stop,
+        ContainerAction::Restart => ContainerActionDto::Restart,
     }
 }
 

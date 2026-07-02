@@ -63,7 +63,7 @@ pub(crate) fn resolve_editor() -> Option<(String, Vec<String>)> {
 /// Suspend the TUI, run the user's editor on `path`, then restore the TUI.
 ///
 /// `mouse_capture_was_on` tells us whether to re-enable mouse capture on
-/// resume — the caller tracks this because `v` (select mode) may have
+/// resume — the caller tracks this because Alt+V (select mode) may have
 /// disabled it before the user triggered the edit.
 #[allow(dead_code)]
 pub fn launch<B: Backend>(

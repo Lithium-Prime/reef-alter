@@ -5,14 +5,14 @@
 //! these workers and merged back into `App` from `tick()`.
 
 use crate::app::{CommitFileDiff, DiffHighlighted, HighlightedDiff};
-use crate::backend::{Backend, RepoDiscoverOpts, RepoDiscoverResponse};
+use crate::backend::{Backend, ContainerInfo, RepoDiscoverOpts, RepoDiscoverResponse};
 use crate::file_tree::{PreviewContent, TreeEntry};
 use crate::git::graph::GraphRow;
 use crate::git::{CommitDetail, DiffContent, FileEntry, RefLabel, StashDetail, StashEntry};
 use crate::global_search::MatchHit;
 use crate::paste_conflict::Resolution;
 use crate::ui::highlight;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -103,6 +103,11 @@ pub struct GraphPayload {
 }
 
 #[derive(Debug)]
+pub struct ContainersPayload {
+    pub containers: Vec<ContainerInfo>,
+}
+
+#[derive(Debug)]
 pub enum WorkerResult {
     RepoCatalog {
         generation: u64,
@@ -116,9 +121,22 @@ pub enum WorkerResult {
         generation: u64,
         result: Result<Option<PreviewContent>, String>,
     },
+    PreviewHighlight {
+        generation: u64,
+        file_path: String,
+        highlighted: Option<Vec<Vec<(ratatui::style::Style, String)>>>,
+    },
+    PreviewImageDecoded {
+        generation: u64,
+        result: Result<Option<PreviewContent>, String>,
+    },
     GitStatus {
         generation: u64,
         result: Result<GitStatusPayload, String>,
+    },
+    Containers {
+        generation: u64,
+        result: Result<ContainersPayload, String>,
     },
     StashDetail {
         generation: u64,
@@ -317,6 +335,18 @@ enum FilesTask {
         dark: bool,
         wants_decoded_image: bool,
     },
+    HighlightPreview {
+        generation: u64,
+        file_path: String,
+        lines: Vec<String>,
+        dark: bool,
+    },
+    DecodePreviewImage {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        rel_path: PathBuf,
+        dark: bool,
+    },
     /// Warm the preview cache for a neighbor of the currently-selected
     /// file. Same decode path as `LoadPreview`, but the result is
     /// **discarded** — the side effect is populating
@@ -479,6 +509,10 @@ enum GitTask {
         repo_root_rel: PathBuf,
         stash_ref: String,
     },
+    RefreshContainers {
+        generation: u64,
+        backend: Arc<dyn Backend>,
+    },
 }
 
 enum GlobalSearchTask {
@@ -604,6 +638,36 @@ impl TaskCoordinator {
             rel_path,
             dark,
             wants_decoded_image,
+        });
+    }
+
+    pub fn highlight_preview(
+        &self,
+        generation: u64,
+        file_path: String,
+        lines: Vec<String>,
+        dark: bool,
+    ) {
+        let _ = self.preview_tx.send(FilesTask::HighlightPreview {
+            generation,
+            file_path,
+            lines,
+            dark,
+        });
+    }
+
+    pub fn decode_preview_image(
+        &self,
+        generation: u64,
+        backend: Arc<dyn Backend>,
+        rel_path: PathBuf,
+        dark: bool,
+    ) {
+        let _ = self.preview_tx.send(FilesTask::DecodePreviewImage {
+            generation,
+            backend,
+            rel_path,
+            dark,
         });
     }
 
@@ -830,6 +894,13 @@ impl TaskCoordinator {
             backend,
             repo_root_rel,
             stash_ref,
+        });
+    }
+
+    pub fn refresh_containers(&self, generation: u64, backend: Arc<dyn Backend>) {
+        let _ = self.git_tx.send(GitTask::RefreshContainers {
+            generation,
+            backend,
         });
     }
 
@@ -1132,7 +1203,9 @@ fn spawn_files_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<Fil
                     // Prefetches route through the dedicated prefetch
                     // worker; this arm is retained only for match
                     // completeness and should never fire in practice.
-                    FilesTask::PrefetchPreview { .. } => {}
+                    FilesTask::PrefetchPreview { .. }
+                    | FilesTask::HighlightPreview { .. }
+                    | FilesTask::DecodePreviewImage { .. } => {}
                 }
             }
         });
@@ -1574,7 +1647,8 @@ fn spawn_preview_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<F
     let _ = thread::Builder::new()
         .name("reef-preview-worker".into())
         .spawn(move || {
-            while let Ok(task) = rx.recv() {
+            let mut pending = VecDeque::new();
+            while let Some(task) = next_preview_task(&rx, &mut pending) {
                 match task {
                     FilesTask::LoadPreview {
                         generation,
@@ -1588,11 +1662,72 @@ fn spawn_preview_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<F
                         });
                         let _ = result_tx.send(WorkerResult::Preview { generation, result });
                     }
+                    FilesTask::HighlightPreview {
+                        generation,
+                        file_path,
+                        lines,
+                        dark,
+                    } => {
+                        let highlighted =
+                            crate::ui::highlight::highlight_file(&file_path, &lines, dark);
+                        let _ = result_tx.send(WorkerResult::PreviewHighlight {
+                            generation,
+                            file_path,
+                            highlighted,
+                        });
+                    }
+                    FilesTask::DecodePreviewImage {
+                        generation,
+                        backend,
+                        rel_path,
+                        dark,
+                    } => {
+                        let result = run_preview_with_panic_guard(&rel_path, || {
+                            backend.load_preview(&rel_path, dark, true)
+                        });
+                        let _ = result_tx.send(WorkerResult::PreviewImageDecoded {
+                            generation,
+                            result,
+                        });
+                    }
                     _ => {}
                 }
             }
         });
     tx
+}
+
+fn next_preview_task(
+    rx: &mpsc::Receiver<FilesTask>,
+    pending: &mut VecDeque<FilesTask>,
+) -> Option<FilesTask> {
+    if pending.is_empty() {
+        pending.push_back(rx.recv().ok()?);
+    }
+    while let Ok(task) = rx.try_recv() {
+        pending.push_back(task);
+    }
+
+    if let Some(pos) = pending
+        .iter()
+        .rposition(|task| matches!(task, FilesTask::LoadPreview { .. }))
+    {
+        let mut later = pending.split_off(pos);
+        let latest = later.pop_front().expect("position checked");
+        pending.clear();
+        pending.append(&mut later);
+        return Some(latest);
+    }
+
+    while let Some(task) = pending.pop_front() {
+        if matches!(
+            task,
+            FilesTask::HighlightPreview { .. } | FilesTask::DecodePreviewImage { .. }
+        ) {
+            return Some(task);
+        }
+    }
+    None
 }
 
 fn spawn_preview_prefetch_worker() -> mpsc::Sender<FilesTask> {
@@ -1688,6 +1823,16 @@ fn spawn_git_worker(result_tx: mpsc::Sender<WorkerResult>) -> mpsc::Sender<GitTa
                             .stash_detail_for(&repo_root_rel, &stash_ref)
                             .map_err(|e| e.to_string());
                         let _ = result_tx.send(WorkerResult::StashDetail { generation, result });
+                    }
+                    GitTask::RefreshContainers {
+                        generation,
+                        backend,
+                    } => {
+                        let result = backend
+                            .list_containers()
+                            .map(|containers| ContainersPayload { containers })
+                            .map_err(|e| e.to_string());
+                        let _ = result_tx.send(WorkerResult::Containers { generation, result });
                     }
                 }
             }
@@ -3096,6 +3241,7 @@ mod preview_panic_guard_tests {
             body: crate::file_tree::PreviewBody::Text {
                 lines: vec!["hi".into()],
                 highlighted: None,
+                source_bytes: 2,
             },
         };
         let result = run_preview_with_panic_guard(Path::new("x.txt"), move || Some(preview));
@@ -3120,11 +3266,13 @@ mod preview_priority_tests {
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, mpsc};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     struct BlockingPreviewBackend {
         prefetch_started_tx: Mutex<Option<mpsc::Sender<()>>>,
         prefetch_release_rx: Mutex<mpsc::Receiver<()>>,
+        preview_calls: AtomicUsize,
     }
 
     impl BlockingPreviewBackend {
@@ -3132,6 +3280,7 @@ mod preview_priority_tests {
             Self {
                 prefetch_started_tx: Mutex::new(Some(started_tx)),
                 prefetch_release_rx: Mutex::new(release_rx),
+                preview_calls: AtomicUsize::new(0),
             }
         }
     }
@@ -3142,6 +3291,7 @@ mod preview_priority_tests {
             body: crate::file_tree::PreviewBody::Text {
                 lines: vec!["ok".into()],
                 highlighted: None,
+                source_bytes: 2,
             },
         }
     }
@@ -3176,6 +3326,18 @@ mod preview_priority_tests {
             unused_backend_method!("discover_repos")
         }
 
+        fn list_containers(&self) -> Result<Vec<ContainerInfo>, BackendError> {
+            unused_backend_method!("list_containers")
+        }
+
+        fn container_action(
+            &self,
+            _id: &str,
+            _action: crate::backend::ContainerAction,
+        ) -> Result<(), BackendError> {
+            unused_backend_method!("container_action")
+        }
+
         fn build_file_tree(
             &self,
             _expanded: &HashSet<PathBuf>,
@@ -3190,7 +3352,8 @@ mod preview_priority_tests {
             _dark: bool,
             _wants_decoded_image: bool,
         ) -> Option<PreviewContent> {
-            if rel_path == Path::new("slow.prefetch") {
+            self.preview_calls.fetch_add(1, Ordering::SeqCst);
+            if rel_path == Path::new("slow.blocking") {
                 if let Some(tx) = self.prefetch_started_tx.lock().unwrap().take() {
                     let _ = tx.send(());
                 }
@@ -3351,6 +3514,18 @@ mod preview_priority_tests {
             _base: Option<&str>,
         ) -> Result<(), BackendError> {
             unused_backend_method!("create_branch_for")
+        }
+
+        fn merge_branch(&self, _branch: &str) -> Result<(), BackendError> {
+            unused_backend_method!("merge_branch")
+        }
+
+        fn merge_branch_for(
+            &self,
+            _repo_root_rel: &Path,
+            _branch: &str,
+        ) -> Result<(), BackendError> {
+            unused_backend_method!("merge_branch_for")
         }
 
         fn list_stashes(&self) -> Result<Vec<StashEntry>, BackendError> {
@@ -3634,7 +3809,7 @@ mod preview_priority_tests {
 
         tasks.prefetch_preview(
             backend.clone(),
-            PathBuf::from("slow.prefetch"),
+            PathBuf::from("slow.blocking"),
             false,
             false,
         );
@@ -3661,6 +3836,44 @@ mod preview_priority_tests {
         assert!(
             got_preview,
             "real LoadPreview should not wait for an already-running prefetch"
+        );
+    }
+
+    #[test]
+    fn queued_preview_loads_are_latest_wins() {
+        let tasks = TaskCoordinator::new();
+        let (_started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let backend = Arc::new(BlockingPreviewBackend::new(_started_tx, release_rx));
+
+        tasks.load_preview(1, backend.clone(), PathBuf::from("slow.blocking"), false, false);
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first preview should start and block");
+
+        tasks.load_preview(2, backend.clone(), PathBuf::from("stale.txt"), false, false);
+        tasks.load_preview(3, backend.clone(), PathBuf::from("fresh.txt"), false, false);
+        let _ = release_tx.send(());
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut saw_fresh = false;
+        while Instant::now() < deadline {
+            if let Ok(WorkerResult::Preview { generation, result }) = tasks.try_recv() {
+                if generation == 3 {
+                    let content = result.expect("panic guard ok").expect("preview content");
+                    assert_eq!(content.file_path, "fresh.txt");
+                    saw_fresh = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(saw_fresh, "latest queued preview should be delivered");
+        assert_eq!(
+            backend.preview_calls.load(Ordering::SeqCst),
+            2,
+            "worker should run the in-flight preview and the newest queued preview only"
         );
     }
 }

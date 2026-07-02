@@ -1,5 +1,6 @@
 use crate::backend::{
-    Backend, LocalBackend, RepoDiscoverOpts, WorkspaceRepoMeta, normalize_repo_root_rel,
+    Backend, ContainerAction, ContainerInfo, LocalBackend, RepoDiscoverOpts, WorkspaceRepoMeta,
+    normalize_repo_root_rel,
 };
 use crate::file_tree::{FileTree, PreviewBody, PreviewContent};
 use crate::git::graph::GraphRow;
@@ -217,6 +218,7 @@ pub enum Tab {
     Git,
     Files,
     Graph,
+    Containers,
     /// Persistent global-search view. Shares `app.global_search` state with
     /// the Space+F overlay — picking up a running query seamlessly when the
     /// user pins the overlay via Alt/Ctrl+Enter, or starts fresh by
@@ -228,7 +230,13 @@ impl Tab {
     /// Canonical ordering shared by the tab bar renderer and the digit
     /// shortcut. Order mirrors VSCode's Activity Bar (Files → Search → …)
     /// so Search sits adjacent to Files, where it belongs mentally.
-    pub const ALL: &'static [Tab] = &[Tab::Files, Tab::Search, Tab::Git, Tab::Graph];
+    pub const ALL: &'static [Tab] = &[
+        Tab::Files,
+        Tab::Search,
+        Tab::Git,
+        Tab::Graph,
+        Tab::Containers,
+    ];
 
     pub fn label(self) -> &'static str {
         use crate::i18n::{Msg, t};
@@ -237,8 +245,15 @@ impl Tab {
             Tab::Search => t(Msg::TabSearch),
             Tab::Git => t(Msg::TabGit),
             Tab::Graph => t(Msg::TabGraph),
+            Tab::Containers => t(Msg::TabContainers),
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ContainersState {
+    pub containers: Vec<ContainerInfo>,
+    pub selected_idx: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -854,6 +869,12 @@ pub struct App {
 
     pub pull_in_flight: bool,
     pub pull_rx: Option<mpsc::Receiver<Result<(), String>>>,
+    pub merge_in_flight: bool,
+    pub merge_rx: Option<mpsc::Receiver<(String, Result<(), String>)>>,
+    pub containers: ContainersState,
+    pub containers_load: AsyncState,
+    pub container_action_in_flight: bool,
+    pub container_action_rx: Option<mpsc::Receiver<(String, ContainerAction, Result<(), String>)>>,
 
     /// `true` while a background `git commit` is in flight. Blocks
     /// additional commit attempts and lets the status panel render a
@@ -1058,6 +1079,11 @@ pub(crate) fn compute_uses_three_col(
         && (has_file_diff || load_in_flight)
 }
 
+pub fn short_container_id(id: &str) -> &str {
+    let end = id.char_indices().nth(12).map(|(idx, _)| idx).unwrap_or(id.len());
+    &id[..end]
+}
+
 /// Pure layout: left-sidebar width given the split percent. Kept free-
 /// standing so `ui::render`, hit-testing, and h-scroll routing share one
 /// definition; the `App::graph_sidebar_width` method forwards here.
@@ -1239,6 +1265,17 @@ impl App {
             push_rx: None,
             pull_in_flight: false,
             pull_rx: None,
+            merge_in_flight: false,
+            merge_rx: None,
+            containers: ContainersState::default(),
+            containers_load: AsyncState {
+                generation: 0,
+                loading: false,
+                stale: true,
+                error: None,
+            },
+            container_action_in_flight: false,
+            container_action_rx: None,
             commit_in_flight: false,
             commit_rx: None,
             fs_watcher_rx,
@@ -2840,13 +2877,10 @@ impl App {
     fn dispatch_preview_load(&mut self, rel_path: PathBuf) {
         let generation = self.preview_load.begin();
         self.preview_in_flight_path = Some(rel_path.clone());
-        // Skip the image decode when we can't render pixels anyway —
-        // the worker will return a metadata-only `ImagePreview` with
-        // dims + format + size, and the render path shows the
-        // "image preview unavailable" card instead. Saves 50-200 ms
-        // per PNG on non-graphics terminals (legacy Terminal.app, SSH,
-        // `REEF_IMAGE_PROTOCOL=off`).
-        let wants_decoded_image = self.image_picker.is_some();
+        // First paint is metadata-only. If the terminal can render
+        // images, `queue_preview_followups` schedules the decode as a
+        // second stage after the card is visible.
+        let wants_decoded_image = false;
         self.tasks.load_preview(
             generation,
             Arc::clone(&self.backend),
@@ -2854,6 +2888,89 @@ impl App {
             self.theme.is_dark,
             wants_decoded_image,
         );
+    }
+
+    fn queue_preview_followups(&self, generation: u64) {
+        let Some(preview) = self.preview_content.as_ref() else {
+            return;
+        };
+        match &preview.body {
+            PreviewBody::Text {
+                lines,
+                highlighted,
+                source_bytes,
+            } if highlighted.is_none() && *source_bytes <= 512 * 1024 && lines.len() <= 5_000 => {
+                self.tasks.highlight_preview(
+                    generation,
+                    preview.file_path.clone(),
+                    lines.clone(),
+                    self.theme.is_dark,
+                );
+            }
+            PreviewBody::Image(img) if self.image_picker.is_some() && img.image.is_none() => {
+                self.tasks.decode_preview_image(
+                    generation,
+                    Arc::clone(&self.backend),
+                    PathBuf::from(&preview.file_path),
+                    self.theme.is_dark,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_preview_image_protocol(
+        &mut self,
+        generation: u64,
+        content: Option<&mut PreviewContent>,
+    ) {
+        let reuse_protocol = self.preview_image_protocol.is_some()
+            && matches!(
+                (
+                    self.preview_content.as_ref().map(|c| &c.body),
+                    content.as_ref().map(|c| &c.body),
+                ),
+                (
+                    Some(PreviewBody::Image(old)),
+                    Some(PreviewBody::Image(new)),
+                ) if old.bytes_on_disk == new.bytes_on_disk
+                    && old.width_px == new.width_px
+                    && old.height_px == new.height_px
+                    && old.format == new.format
+                    && old.image.is_some() == new.image.is_some()
+            );
+        if reuse_protocol {
+            if let Some(PreviewBody::Image(img)) = content.map(|c| &mut c.body) {
+                img.image = None;
+            }
+            return;
+        }
+
+        let dyn_img = match (self.image_picker.as_ref(), content.map(|c| &mut c.body)) {
+            (Some(_), Some(PreviewBody::Image(img))) => img.image.take(),
+            _ => None,
+        };
+        if let (Some(dyn_img), Some(picker)) = (dyn_img, self.image_picker.as_ref()) {
+            self.preview_image_protocol = Some(ratatui_image::thread::ThreadProtocol::new(
+                self.preview_resize_tx.clone(),
+                None,
+            ));
+            self.preview_image_protocol_builds += 1;
+            let picker_clone = picker.clone();
+            let build_tx = self.preview_build_tx.clone();
+            std::thread::Builder::new()
+                .name("reef-image-build".into())
+                .spawn(move || {
+                    let proto = picker_clone.new_resize_protocol(dyn_img);
+                    let _ = build_tx.send(BuiltProtocol {
+                        generation,
+                        protocol: proto,
+                    });
+                })
+                .ok();
+        } else {
+            self.preview_image_protocol = None;
+        }
     }
 
     /// Pull any completed resize responses from the background
@@ -4350,6 +4467,85 @@ impl App {
         }
     }
 
+    pub fn run_merge_branch(&mut self, branch: &str) {
+        let branch = branch.trim();
+        if self.merge_in_flight || branch.is_empty() || branch == self.branch_name {
+            return;
+        }
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
+        let branch = branch.to_string();
+        let backend = Arc::clone(&self.backend);
+        let (tx, rx) = mpsc::channel();
+        self.merge_rx = Some(rx);
+        self.merge_in_flight = true;
+        std::thread::spawn(move || {
+            let result = backend
+                .merge_branch_for(&repo_root_rel, &branch)
+                .map_err(|e| e.to_string());
+            let _ = tx.send((branch, result));
+        });
+    }
+
+    pub fn refresh_containers(&mut self) {
+        let generation = self.containers_load.begin();
+        self.tasks
+            .refresh_containers(generation, Arc::clone(&self.backend));
+    }
+
+    pub fn select_container(&mut self, idx: usize) {
+        if self.containers.containers.is_empty() {
+            self.containers.selected_idx = 0;
+        } else {
+            self.containers.selected_idx = idx.min(self.containers.containers.len() - 1);
+        }
+    }
+
+    pub fn move_container_selection(&mut self, delta: isize) {
+        let len = self.containers.containers.len();
+        if len == 0 {
+            self.containers.selected_idx = 0;
+            return;
+        }
+        let current = self.containers.selected_idx.min(len - 1);
+        let next = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta as usize).min(len - 1)
+        };
+        self.containers.selected_idx = next;
+    }
+
+    pub fn selected_container(&self) -> Option<&ContainerInfo> {
+        self.containers.containers.get(self.containers.selected_idx)
+    }
+
+    pub fn run_container_action(&mut self, action: ContainerAction) {
+        if self.container_action_in_flight {
+            return;
+        }
+        let Some(container) = self.selected_container().cloned() else {
+            return;
+        };
+        let id = container.id.clone();
+        let name = if container.names.is_empty() {
+            short_container_id(&container.id).to_string()
+        } else {
+            container.names.clone()
+        };
+        let backend = Arc::clone(&self.backend);
+        let (tx, rx) = mpsc::channel();
+        self.container_action_rx = Some(rx);
+        self.container_action_in_flight = true;
+        std::thread::spawn(move || {
+            let result = backend
+                .container_action(&id, action)
+                .map_err(|e| e.to_string());
+            let _ = tx.send((name, action, result));
+        });
+    }
+
     pub fn branch_create_base_choices(&self) -> Vec<String> {
         let mut choices = Vec::new();
         if !self.branch_name.is_empty() && self.branch_name != "(detached)" {
@@ -4539,6 +4735,72 @@ impl App {
         }
     }
 
+    fn drain_merge_result(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(rx) = self.merge_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((branch, result)) => {
+                self.merge_in_flight = false;
+                self.merge_rx = None;
+                match result {
+                    Ok(()) => {
+                        self.toasts
+                            .push(Toast::info(crate::i18n::branch_merged_toast(&branch)));
+                    }
+                    Err(e) => {
+                        self.toasts
+                            .push(Toast::error(crate::i18n::branch_merge_failed_toast(&e)));
+                    }
+                }
+                self.selected_file = None;
+                self.diff_content = None;
+                self.git_status.confirm_discard = None;
+                self.git_graph.cache_key = None;
+                self.git_status_load.mark_stale();
+                self.diff_load.mark_stale();
+                self.graph_load.mark_stale();
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.merge_in_flight = false;
+                self.merge_rx = None;
+                self.toasts
+                    .push(Toast::error(crate::i18n::branch_merge_thread_crashed()));
+            }
+        }
+    }
+
+    fn drain_container_action_result(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(rx) = self.container_action_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((name, action, result)) => {
+                self.container_action_in_flight = false;
+                self.container_action_rx = None;
+                match result {
+                    Ok(()) => self.toasts.push(Toast::info(
+                        crate::i18n::container_action_success(action.label(), &name),
+                    )),
+                    Err(e) => self.toasts.push(Toast::error(
+                        crate::i18n::container_action_failed(action.label(), &e),
+                    )),
+                }
+                self.containers_load.mark_stale();
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.container_action_in_flight = false;
+                self.container_action_rx = None;
+                self.toasts
+                    .push(Toast::error(crate::i18n::container_action_thread_crashed()));
+            }
+        }
+    }
+
     fn drain_task_results(&mut self) {
         use std::sync::mpsc::TryRecvError;
         loop {
@@ -4678,94 +4940,9 @@ impl App {
                             (self.preview_content.as_ref(), content.as_ref()),
                             (Some(old), Some(new)) if old.file_path == new.file_path
                         );
-                        // Decide the protocol fate in three buckets:
-                        //
-                        // 1. Same-file re-load where old and new are both
-                        //    images with identical (bytes_on_disk, w, h,
-                        //    format) — a conservative "pixels probably
-                        //    didn't change" heuristic that covers
-                        //    re-selecting the same file. Keep the existing
-                        //    protocol so ratatui-image doesn't re-encode
-                        //    and the UI doesn't flicker.
-                        // 2. Other Image bodies — build a fresh protocol
-                        //    by moving the decoded `DynamicImage` out of
-                        //    the worker payload (so we don't keep two
-                        //    copies of the pixels alive).
-                        // 3. Non-image bodies or no picker — drop any
-                        //    stale protocol so we don't keep a previous
-                        //    image lingering.
-                        let reuse_protocol = same_file
-                            && self.preview_image_protocol.is_some()
-                            && matches!(
-                                (
-                                    self.preview_content.as_ref().map(|c| &c.body),
-                                    content.as_ref().map(|c| &c.body),
-                                ),
-                                (
-                                    Some(crate::file_tree::PreviewBody::Image(old)),
-                                    Some(crate::file_tree::PreviewBody::Image(new)),
-                                ) if old.bytes_on_disk == new.bytes_on_disk
-                                    && old.width_px == new.width_px
-                                    && old.height_px == new.height_px
-                                    && old.format == new.format
-                            );
-                        if !reuse_protocol {
-                            // Two-step protocol swap-in:
-                            //   1. Immediately install an EMPTY
-                            //      ThreadProtocol so render can already
-                            //      enter the image branch (it no-ops on
-                            //      the image area until inner lands).
-                            //   2. Spawn a one-shot thread to run
-                            //      `Picker::new_resize_protocol` — that
-                            //      call hashes the full decoded image
-                            //      which on a 2048² RGBA is ~16-30 ms
-                            //      of main-thread work we can't afford
-                            //      during a frame. Result flows back
-                            //      via `preview_build_tx` and gets
-                            //      merged in `drain_preview_protocol_builds`.
-                            let dyn_img = match (
-                                self.image_picker.as_ref(),
-                                content.as_mut().map(|c| &mut c.body),
-                            ) {
-                                (Some(_), Some(crate::file_tree::PreviewBody::Image(img))) => {
-                                    img.image.take()
-                                }
-                                _ => None,
-                            };
-                            if let (Some(dyn_img), Some(picker)) =
-                                (dyn_img, self.image_picker.as_ref())
-                            {
-                                self.preview_image_protocol =
-                                    Some(ratatui_image::thread::ThreadProtocol::new(
-                                        self.preview_resize_tx.clone(),
-                                        None,
-                                    ));
-                                self.preview_image_protocol_builds += 1;
-                                let picker_clone = picker.clone();
-                                let build_tx = self.preview_build_tx.clone();
-                                let build_gen = generation;
-                                std::thread::Builder::new()
-                                    .name("reef-image-build".into())
-                                    .spawn(move || {
-                                        let proto = picker_clone.new_resize_protocol(dyn_img);
-                                        let _ = build_tx.send(BuiltProtocol {
-                                            generation: build_gen,
-                                            protocol: proto,
-                                        });
-                                    })
-                                    .ok();
-                            } else {
-                                // Non-image body, or no picker available.
-                                self.preview_image_protocol = None;
-                            }
-                        } else if let Some(crate::file_tree::PreviewBody::Image(img)) =
-                            content.as_mut().map(|c| &mut c.body)
-                        {
-                            // Drop the new DynamicImage — the kept
-                            // protocol already has its own copy.
-                            img.image = None;
-                        }
+                        self.apply_preview_image_protocol(generation, content.as_mut());
                         self.preview_content = content;
+                        self.queue_preview_followups(generation);
                         if !same_file {
                             self.preview_scroll = 0;
                             self.preview_h_scroll = 0;
@@ -4845,6 +5022,32 @@ impl App {
                     }
                 }
             },
+            WorkerResult::PreviewHighlight {
+                generation,
+                file_path,
+                highlighted,
+            } => {
+                if generation == self.preview_load.generation
+                    && let Some(preview) = self.preview_content.as_mut()
+                    && preview.file_path == file_path
+                    && let PreviewBody::Text {
+                        highlighted: current,
+                        ..
+                    } = &mut preview.body
+                {
+                    *current = highlighted;
+                }
+            }
+            WorkerResult::PreviewImageDecoded { generation, result } => {
+                if generation == self.preview_load.generation
+                    && let Ok(Some(mut decoded)) = result
+                    && let Some(preview) = self.preview_content.as_ref()
+                    && preview.file_path == decoded.file_path
+                {
+                    self.apply_preview_image_protocol(generation, Some(&mut decoded));
+                    self.preview_content = Some(decoded);
+                }
+            }
             WorkerResult::GitStatus { generation, result } => match result {
                 Ok(payload) => {
                     if self.git_status_load.complete_ok(generation) {
@@ -4902,6 +5105,20 @@ impl App {
                 }
                 Err(error) => {
                     self.git_status_load.complete_err(generation, error);
+                }
+            },
+            WorkerResult::Containers { generation, result } => match result {
+                Ok(payload) => {
+                    if self.containers_load.complete_ok(generation) {
+                        self.containers.containers = payload.containers;
+                        if self.containers.selected_idx >= self.containers.containers.len() {
+                            self.containers.selected_idx =
+                                self.containers.containers.len().saturating_sub(1);
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.containers_load.complete_err(generation, error);
                 }
             },
             WorkerResult::StashDetail { generation, result } => match result {
@@ -5283,6 +5500,7 @@ impl App {
         match tab {
             Tab::Git => self.git_status_load.mark_stale(),
             Tab::Graph => self.graph_load.mark_stale(),
+            Tab::Containers => self.containers_load.mark_stale(),
             Tab::Files => {
                 if self.file_tree.entries.is_empty() {
                     self.file_tree_load.mark_stale();
@@ -5321,6 +5539,7 @@ impl App {
             Tab::Graph => from_state("graph", &self.graph_load)
                 .or_else(|| from_state("commit", &self.commit_detail_load))
                 .or_else(|| from_state("commit diff", &self.commit_file_diff_load)),
+            Tab::Containers => from_state("containers", &self.containers_load),
             // Search activity is surfaced in the tab's own footer (`N / M ·
             // scanning…`), not in the global status bar.
             Tab::Search => {
@@ -5340,6 +5559,9 @@ impl App {
             }
             ClickAction::ToggleSidebar => {
                 self.toggle_sidebar();
+            }
+            ClickAction::ContainerSelect(index) => {
+                self.select_container(index);
             }
             ClickAction::TreeClick(index) => {
                 self.file_tree.selected = index;
@@ -5650,6 +5872,8 @@ impl App {
         self.drain_preview_protocol_builds();
         self.drain_push_result();
         self.drain_pull_result();
+        self.drain_merge_result();
+        self.drain_container_action_result();
         self.drain_commit_result();
         self.kick_active_tab_work();
         self.tick_place_mode_auto_expand();
@@ -5869,6 +6093,11 @@ impl App {
                     self.load_preview_for_path(hit.path);
                 }
             }
+            Tab::Containers => {
+                if self.containers_load.should_request() {
+                    self.refresh_containers();
+                }
+            }
         }
     }
 }
@@ -5925,7 +6154,7 @@ mod tests {
 
     #[test]
     fn graph_state_selected_range_collapsed_anchor_is_single() {
-        // `V` just entered visual mode — anchor sits on the cursor.
+        // Ctrl+Alt+V just entered visual mode — anchor sits on the cursor.
         let g = GitGraphState {
             selected_idx: 3,
             selection_anchor: Some(3),
