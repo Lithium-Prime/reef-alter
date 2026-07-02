@@ -1,5 +1,5 @@
 {
-  "name": "@reef-tui/cli-darwin-x64",
+  "name": "@lithium-prime/reef-alter-darwin-x64",
   "version": "0.0.0",
   "description": "Reef CLI native binary for macOS x64",
   "os": ["darwin"],
@@ -7,7 +7,7 @@
   "files": ["bin"],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Blushyes/reef.git"
+    "url": "git+https://github.com/Lithium-Prime/reef-with-multi-git-repo.git"
   },
   "license": "MIT"
 }

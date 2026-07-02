@@ -1,9 +1,13 @@
 use crate::backend::{
-    Backend, LocalBackend, RepoDiscoverOpts, WorkspaceRepoMeta, normalize_repo_root_rel,
+    Backend, ContainerAction, ContainerInfo, LocalBackend, RepoDiscoverOpts, WorkspaceRepoMeta,
+    normalize_repo_root_rel,
 };
 use crate::file_tree::{FileTree, PreviewBody, PreviewContent};
 use crate::git::graph::GraphRow;
-use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, RefLabel};
+use crate::git::{
+    CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, RefLabel, StashDetail, StashEntry,
+    StashPushOptions,
+};
 use crate::tasks::{AsyncState, TaskCoordinator, WorkerResult};
 use crate::ui::highlight::StyledToken;
 use crate::ui::mouse::{ClickAction, HitTestRegistry};
@@ -30,6 +34,63 @@ pub struct BuiltProtocol {
 /// so rapid scrubbing coalesces into a single load.
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(80);
 const SELECTED_GIT_REPO_PREF: &str = "status.selected_repo";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushOperation {
+    Push { force: bool },
+    PublishBranch,
+}
+
+impl Default for PushOperation {
+    fn default() -> Self {
+        Self::Push { force: false }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitKeyboardFocus {
+    Repository,
+    Branch,
+    CommitMessage,
+    CommitButton,
+    StashButton,
+    PushButton,
+    PublishBranchButton,
+    PullButton,
+    StashHeader,
+    StashAllButton,
+    StashTrackedButton,
+    StashKeepIndexButton,
+    StashStagedButton,
+    StashSelectedButton,
+    Stashes,
+    Files,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingStashAction {
+    Push {
+        options: StashPushOptions,
+        label: String,
+    },
+    Apply {
+        stash_ref: String,
+        reinstate_index: bool,
+    },
+    Pop {
+        stash_ref: String,
+        reinstate_index: bool,
+    },
+    Drop {
+        stash_ref: String,
+    },
+}
+
+impl Default for GitKeyboardFocus {
+    fn default() -> Self {
+        Self::Files
+    }
+}
 
 /// Pagination + table-selection state for the SQLite preview card.
 /// Lives `Some` for as long as the current `preview_content` is a
@@ -157,6 +218,7 @@ pub enum Tab {
     Git,
     Files,
     Graph,
+    Containers,
     /// Persistent global-search view. Shares `app.global_search` state with
     /// the Space+F overlay — picking up a running query seamlessly when the
     /// user pins the overlay via Alt/Ctrl+Enter, or starts fresh by
@@ -168,7 +230,13 @@ impl Tab {
     /// Canonical ordering shared by the tab bar renderer and the digit
     /// shortcut. Order mirrors VSCode's Activity Bar (Files → Search → …)
     /// so Search sits adjacent to Files, where it belongs mentally.
-    pub const ALL: &'static [Tab] = &[Tab::Files, Tab::Search, Tab::Git, Tab::Graph];
+    pub const ALL: &'static [Tab] = &[
+        Tab::Files,
+        Tab::Search,
+        Tab::Git,
+        Tab::Graph,
+        Tab::Containers,
+    ];
 
     pub fn label(self) -> &'static str {
         use crate::i18n::{Msg, t};
@@ -177,8 +245,15 @@ impl Tab {
             Tab::Search => t(Msg::TabSearch),
             Tab::Git => t(Msg::TabGit),
             Tab::Graph => t(Msg::TabGraph),
+            Tab::Containers => t(Msg::TabContainers),
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ContainersState {
+    pub containers: Vec<ContainerInfo>,
+    pub selected_idx: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,6 +330,34 @@ pub enum DiscardTarget {
     Section { is_staged: bool },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchCreateStep {
+    ChooseMode,
+    ChooseBase,
+    EnterName { base: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchCreateDialog {
+    pub step: BranchCreateStep,
+    pub input: String,
+    pub cursor: usize,
+    pub selected_base_idx: usize,
+    pub error: Option<String>,
+}
+
+impl BranchCreateDialog {
+    pub fn choose_mode() -> Self {
+        Self {
+            step: BranchCreateStep::ChooseMode,
+            input: String::new(),
+            cursor: 0,
+            selected_base_idx: 0,
+            error: None,
+        }
+    }
+}
+
 /// State for the inline Git status sidebar.
 #[derive(Debug, Default)]
 pub struct GitStatusState {
@@ -268,10 +371,23 @@ pub struct GitStatusState {
     /// because the banner stays visible across re-renders whereas toasts are
     /// ephemeral.
     pub push_error: Option<String>,
+    pub push_error_kind: PushOperation,
     pub pull_error: Option<String>,
     pub scroll: usize,
     pub ahead_behind: Option<(usize, usize)>,
     pub branches: Vec<String>,
+    pub branch_dropdown_open: bool,
+    pub repo_selector_open: bool,
+    pub branch_dropdown_idx: usize,
+    pub repo_selector_idx: usize,
+    pub keyboard_focus: GitKeyboardFocus,
+    pub stashes: Vec<StashEntry>,
+    pub stash_section_open: bool,
+    pub selected_stash_idx: usize,
+    pub stash_detail: Option<StashDetail>,
+    pub stash_error: Option<String>,
+    pub pending_stash_action: Option<PendingStashAction>,
+    pub branch_create_dialog: Option<BranchCreateDialog>,
 
     // ─── Commit input (VSCode-style "Source Control" message box) ───
     /// Draft commit message buffer. Freeform UTF-8 — newlines are
@@ -746,12 +862,19 @@ pub struct App {
     /// `true` while a background `git push` is in flight. Blocks additional
     /// pushes and lets the status panel render a "推送中…" indicator.
     pub push_in_flight: bool,
-    /// Receives `(force, result)` from the push worker thread. Drained in
+    pub push_in_flight_kind: PushOperation,
+    /// Receives `(operation, result)` from the push worker thread. Drained in
     /// `App::tick`; once the result is consumed we drop the channel.
-    pub push_rx: Option<mpsc::Receiver<(bool, Result<(), String>)>>,
+    pub push_rx: Option<mpsc::Receiver<(PushOperation, Result<(), String>)>>,
 
     pub pull_in_flight: bool,
     pub pull_rx: Option<mpsc::Receiver<Result<(), String>>>,
+    pub merge_in_flight: bool,
+    pub merge_rx: Option<mpsc::Receiver<(String, Result<(), String>)>>,
+    pub containers: ContainersState,
+    pub containers_load: AsyncState,
+    pub container_action_in_flight: bool,
+    pub container_action_rx: Option<mpsc::Receiver<(String, ContainerAction, Result<(), String>)>>,
 
     /// `true` while a background `git commit` is in flight. Blocks
     /// additional commit attempts and lets the status panel render a
@@ -877,6 +1000,7 @@ pub struct App {
     pub file_tree_load: AsyncState,
     pub preview_load: AsyncState,
     pub git_status_load: AsyncState,
+    pub stash_detail_load: AsyncState,
     pub diff_load: AsyncState,
     pub graph_load: AsyncState,
     pub commit_detail_load: AsyncState,
@@ -953,6 +1077,11 @@ pub(crate) fn compute_uses_three_col(
     active_tab == Tab::Graph
         && total_width >= App::GRAPH_THREE_COL_MIN_WIDTH
         && (has_file_diff || load_in_flight)
+}
+
+pub fn short_container_id(id: &str) -> &str {
+    let end = id.char_indices().nth(12).map(|(idx, _)| idx).unwrap_or(id.len());
+    &id[..end]
 }
 
 /// Pure layout: left-sidebar width given the split percent. Kept free-
@@ -1132,9 +1261,21 @@ impl App {
             },
             toasts: Vec::new(),
             push_in_flight: false,
+            push_in_flight_kind: PushOperation::default(),
             push_rx: None,
             pull_in_flight: false,
             pull_rx: None,
+            merge_in_flight: false,
+            merge_rx: None,
+            containers: ContainersState::default(),
+            containers_load: AsyncState {
+                generation: 0,
+                loading: false,
+                stale: true,
+                error: None,
+            },
+            container_action_in_flight: false,
+            container_action_rx: None,
             commit_in_flight: false,
             commit_rx: None,
             fs_watcher_rx,
@@ -1166,6 +1307,7 @@ impl App {
             file_tree_load: AsyncState::default(),
             preview_load: AsyncState::default(),
             git_status_load: AsyncState::default(),
+            stash_detail_load: AsyncState::default(),
             diff_load: AsyncState::default(),
             graph_load: AsyncState::default(),
             commit_detail_load: AsyncState::default(),
@@ -1390,6 +1532,8 @@ impl App {
         self.diff_content = None;
         self.git_status.ahead_behind = None;
         self.git_status.branches.clear();
+        self.git_status.stashes.clear();
+        self.git_status.stash_detail = None;
         self.branch_name.clear();
         self.file_tree.refresh_git_statuses(&[], &[]);
     }
@@ -2733,13 +2877,10 @@ impl App {
     fn dispatch_preview_load(&mut self, rel_path: PathBuf) {
         let generation = self.preview_load.begin();
         self.preview_in_flight_path = Some(rel_path.clone());
-        // Skip the image decode when we can't render pixels anyway —
-        // the worker will return a metadata-only `ImagePreview` with
-        // dims + format + size, and the render path shows the
-        // "image preview unavailable" card instead. Saves 50-200 ms
-        // per PNG on non-graphics terminals (legacy Terminal.app, SSH,
-        // `REEF_IMAGE_PROTOCOL=off`).
-        let wants_decoded_image = self.image_picker.is_some();
+        // First paint is metadata-only. If the terminal can render
+        // images, `queue_preview_followups` schedules the decode as a
+        // second stage after the card is visible.
+        let wants_decoded_image = false;
         self.tasks.load_preview(
             generation,
             Arc::clone(&self.backend),
@@ -2747,6 +2888,89 @@ impl App {
             self.theme.is_dark,
             wants_decoded_image,
         );
+    }
+
+    fn queue_preview_followups(&self, generation: u64) {
+        let Some(preview) = self.preview_content.as_ref() else {
+            return;
+        };
+        match &preview.body {
+            PreviewBody::Text {
+                lines,
+                highlighted,
+                source_bytes,
+            } if highlighted.is_none() && *source_bytes <= 512 * 1024 && lines.len() <= 5_000 => {
+                self.tasks.highlight_preview(
+                    generation,
+                    preview.file_path.clone(),
+                    lines.clone(),
+                    self.theme.is_dark,
+                );
+            }
+            PreviewBody::Image(img) if self.image_picker.is_some() && img.image.is_none() => {
+                self.tasks.decode_preview_image(
+                    generation,
+                    Arc::clone(&self.backend),
+                    PathBuf::from(&preview.file_path),
+                    self.theme.is_dark,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_preview_image_protocol(
+        &mut self,
+        generation: u64,
+        content: Option<&mut PreviewContent>,
+    ) {
+        let reuse_protocol = self.preview_image_protocol.is_some()
+            && matches!(
+                (
+                    self.preview_content.as_ref().map(|c| &c.body),
+                    content.as_ref().map(|c| &c.body),
+                ),
+                (
+                    Some(PreviewBody::Image(old)),
+                    Some(PreviewBody::Image(new)),
+                ) if old.bytes_on_disk == new.bytes_on_disk
+                    && old.width_px == new.width_px
+                    && old.height_px == new.height_px
+                    && old.format == new.format
+                    && old.image.is_some() == new.image.is_some()
+            );
+        if reuse_protocol {
+            if let Some(PreviewBody::Image(img)) = content.map(|c| &mut c.body) {
+                img.image = None;
+            }
+            return;
+        }
+
+        let dyn_img = match (self.image_picker.as_ref(), content.map(|c| &mut c.body)) {
+            (Some(_), Some(PreviewBody::Image(img))) => img.image.take(),
+            _ => None,
+        };
+        if let (Some(dyn_img), Some(picker)) = (dyn_img, self.image_picker.as_ref()) {
+            self.preview_image_protocol = Some(ratatui_image::thread::ThreadProtocol::new(
+                self.preview_resize_tx.clone(),
+                None,
+            ));
+            self.preview_image_protocol_builds += 1;
+            let picker_clone = picker.clone();
+            let build_tx = self.preview_build_tx.clone();
+            std::thread::Builder::new()
+                .name("reef-image-build".into())
+                .spawn(move || {
+                    let proto = picker_clone.new_resize_protocol(dyn_img);
+                    let _ = build_tx.send(BuiltProtocol {
+                        generation,
+                        protocol: proto,
+                    });
+                })
+                .ok();
+        } else {
+            self.preview_image_protocol = None;
+        }
     }
 
     /// Pull any completed resize responses from the background
@@ -3515,17 +3739,690 @@ impl App {
         let Some(repo_root_rel) = self.status_repo_root_rel() else {
             return;
         };
+        let operation = PushOperation::Push { force };
         let backend = Arc::clone(&self.backend);
         let (tx, rx) = mpsc::channel();
         self.push_rx = Some(rx);
         self.push_in_flight = true;
+        self.push_in_flight_kind = operation;
         std::thread::spawn(move || {
             let result = backend
                 .push_for(&repo_root_rel, force)
                 .map_err(|e| e.to_string());
             // Recv side may have been dropped by the time we finish (e.g.
             // user quit mid-push); ignore the send error.
-            let _ = tx.send((force, result));
+            let _ = tx.send((operation, result));
+        });
+    }
+
+    pub fn should_offer_publish_branch(&self) -> bool {
+        self.git_status.ahead_behind.is_none()
+            && !self.branch_name.trim().is_empty()
+            && self.branch_name != "(detached)"
+    }
+
+    pub fn git_branch_selector_visible(&self) -> bool {
+        if self.repo_catalog.selected_git_repo.is_none() && !self.backend.has_repo() {
+            return false;
+        }
+        !self.branch_name.is_empty() || !self.git_status.branches.is_empty()
+    }
+
+    pub fn git_branch_dropdown_branches(&self) -> Vec<String> {
+        self.git_status
+            .branches
+            .iter()
+            .filter(|branch| branch.as_str() != self.branch_name)
+            .take(6)
+            .cloned()
+            .collect()
+    }
+
+    pub fn git_keyboard_focus_order(&self) -> Vec<GitKeyboardFocus> {
+        let mut order = Vec::new();
+        if !self.repo_catalog.repos.is_empty() && !self.repo_catalog.discover_load.loading {
+            order.push(GitKeyboardFocus::Repository);
+        }
+        if self.git_branch_selector_visible() {
+            order.push(GitKeyboardFocus::Branch);
+        }
+        order.push(GitKeyboardFocus::CommitMessage);
+        order.push(GitKeyboardFocus::CommitButton);
+        if let Some((ahead, behind)) = self.git_status.ahead_behind {
+            if ahead > 0 && behind == 0 && !self.push_in_flight {
+                order.push(GitKeyboardFocus::PushButton);
+            }
+        }
+        if self.should_offer_publish_branch() && !self.push_in_flight {
+            order.push(GitKeyboardFocus::PublishBranchButton);
+        }
+        if let Some((_, _)) = self.git_status.ahead_behind {
+            if !self.pull_in_flight {
+                order.push(GitKeyboardFocus::PullButton);
+            }
+        }
+        order.push(GitKeyboardFocus::StashButton);
+        order.push(GitKeyboardFocus::StashHeader);
+        if self.git_status.stash_section_open {
+            order.push(GitKeyboardFocus::StashAllButton);
+            order.push(GitKeyboardFocus::StashTrackedButton);
+            order.push(GitKeyboardFocus::StashKeepIndexButton);
+            order.push(GitKeyboardFocus::StashStagedButton);
+            order.push(GitKeyboardFocus::StashSelectedButton);
+            if !self.git_status.stashes.is_empty() {
+                order.push(GitKeyboardFocus::Stashes);
+            }
+        }
+        order.push(GitKeyboardFocus::Files);
+        order
+    }
+
+    fn normalize_git_keyboard_focus(&mut self) {
+        if self.repo_catalog.selected_git_repo.is_none() && !self.repo_catalog.repos.is_empty() {
+            self.git_status.keyboard_focus = GitKeyboardFocus::Repository;
+        }
+        let order = self.git_keyboard_focus_order();
+        if !order.contains(&self.git_status.keyboard_focus) {
+            self.git_status.keyboard_focus = GitKeyboardFocus::Files;
+        }
+        if !self.repo_catalog.repos.is_empty() {
+            let max = self.repo_catalog.repos.len().saturating_sub(1);
+            self.git_status.repo_selector_idx = self.git_status.repo_selector_idx.min(max);
+        }
+        if !self.git_status.stashes.is_empty() {
+            let max = self.git_status.stashes.len().saturating_sub(1);
+            self.git_status.selected_stash_idx = self.git_status.selected_stash_idx.min(max);
+        }
+    }
+
+    pub fn selected_repo_idx(&self) -> Option<usize> {
+        let selected = self.repo_catalog.selected_git_repo.as_ref()?;
+        self.repo_catalog
+            .repos
+            .iter()
+            .position(|repo| &repo.repo_root_rel == selected)
+    }
+
+    fn select_git_repo_at_idx(&mut self, idx: usize) {
+        let Some(repo_root_rel) = self
+            .repo_catalog
+            .repos
+            .get(idx)
+            .map(|repo| repo.repo_root_rel.clone())
+        else {
+            return;
+        };
+        self.repo_catalog.selected_git_repo = Some(repo_root_rel.clone());
+        crate::prefs::set(
+            "status.selected_repo",
+            &crate::backend::repo_key(&repo_root_rel),
+        );
+        self.reset_git_snapshot_for_repo_switch();
+        self.refresh_status();
+        self.graph_load.invalidate_stale();
+    }
+
+    fn reset_git_snapshot_for_repo_switch(&mut self) {
+        self.selected_file = None;
+        self.diff_content = None;
+        self.diff_scroll = 0;
+        self.diff_h_scroll = 0;
+        self.git_status.confirm_discard = None;
+        self.git_status.confirm_push = false;
+        self.git_status.confirm_force_push = false;
+        self.git_status.branch_dropdown_open = false;
+        self.git_status.repo_selector_open = false;
+        self.git_status.branch_dropdown_idx = 0;
+        self.git_status.stashes.clear();
+        self.git_status.selected_stash_idx = 0;
+        self.git_status.stash_detail = None;
+        self.git_status.stash_error = None;
+        self.git_status.pending_stash_action = None;
+        self.git_status.branch_create_dialog = None;
+        self.git_status.branches.clear();
+        self.staged_files.clear();
+        self.unstaged_files.clear();
+        self.branch_name.clear();
+        self.git_status.ahead_behind = None;
+        self.git_status.push_error = None;
+        self.git_status.pull_error = None;
+        self.git_status.commit_error = None;
+        self.git_graph.rows.clear();
+        self.git_graph.ref_map.clear();
+        self.git_graph.cache_key = None;
+        self.git_graph.selected_idx = 0;
+        self.git_graph.selected_commit = None;
+        self.git_graph.selection_anchor = None;
+        self.commit_detail.detail = None;
+        self.commit_detail.range_detail = None;
+        self.commit_detail.file_diff = None;
+        self.diff_load.invalidate();
+        self.commit_detail_load.invalidate();
+        self.commit_file_diff_load.invalidate();
+        self.stash_detail_load.invalidate();
+    }
+
+    fn repo_selector_effectively_open(&self) -> bool {
+        self.git_status.repo_selector_open || self.repo_catalog.selected_git_repo.is_none()
+    }
+
+    fn git_selected_file_idx(&self) -> Option<usize> {
+        let sel = self.selected_file.as_ref()?;
+        self.git_selectable_files()
+            .iter()
+            .position(|(path, staged)| path == &sel.path && *staged == sel.is_staged)
+    }
+
+    fn git_selectable_files(&self) -> Vec<(String, bool)> {
+        let mut items = Vec::new();
+        if !self.staged_files.is_empty() && !self.staged_collapsed {
+            for f in &self.staged_files {
+                items.push((f.path.clone(), true));
+            }
+        }
+        if !self.unstaged_collapsed {
+            for f in &self.unstaged_files {
+                items.push((f.path.clone(), false));
+            }
+        }
+        items
+    }
+
+    pub fn move_git_keyboard_focus_vertical(&mut self, delta: i32) {
+        if self.git_status.branch_dropdown_open
+            && self.git_status.keyboard_focus == GitKeyboardFocus::Branch
+        {
+            let max = self.git_branch_dropdown_branches().len();
+            if delta < 0 {
+                self.git_status.branch_dropdown_idx =
+                    self.git_status.branch_dropdown_idx.saturating_sub(1);
+            } else if delta > 0 {
+                self.git_status.branch_dropdown_idx =
+                    (self.git_status.branch_dropdown_idx + 1).min(max);
+            }
+            return;
+        }
+
+        self.normalize_git_keyboard_focus();
+        if self.git_status.keyboard_focus == GitKeyboardFocus::Repository {
+            let repo_count = self.repo_catalog.repos.len();
+            if repo_count > 0 && self.repo_selector_effectively_open() {
+                let idx = self.git_status.repo_selector_idx.min(repo_count - 1);
+                self.git_status.repo_selector_idx = idx;
+                if delta < 0 && idx > 0 {
+                    self.git_status.repo_selector_idx = idx - 1;
+                    return;
+                }
+                if delta > 0 && idx + 1 < repo_count {
+                    self.git_status.repo_selector_idx = idx + 1;
+                    return;
+                }
+            }
+        }
+
+        if self.git_status.keyboard_focus == GitKeyboardFocus::Stashes {
+            let count = self.git_status.stashes.len();
+            if count > 0 {
+                let idx = self.git_status.selected_stash_idx.min(count - 1);
+                if delta < 0 && idx > 0 {
+                    self.git_status.selected_stash_idx = idx - 1;
+                    self.load_selected_stash_detail();
+                    return;
+                }
+                if delta > 0 && idx + 1 < count {
+                    self.git_status.selected_stash_idx = idx + 1;
+                    self.load_selected_stash_detail();
+                    return;
+                }
+            }
+        }
+
+        if self.git_status.keyboard_focus == GitKeyboardFocus::Files {
+            let items = self.git_selectable_files();
+            if !items.is_empty() {
+                let idx = self.git_selected_file_idx().unwrap_or(0);
+                if delta < 0 && idx > 0 {
+                    self.navigate_files(delta);
+                    return;
+                }
+                if delta > 0 && idx + 1 < items.len() {
+                    self.navigate_files(delta);
+                    return;
+                }
+            }
+        }
+
+        if matches!(
+            self.git_status.keyboard_focus,
+            GitKeyboardFocus::StashAllButton
+                | GitKeyboardFocus::StashTrackedButton
+                | GitKeyboardFocus::StashKeepIndexButton
+                | GitKeyboardFocus::StashStagedButton
+                | GitKeyboardFocus::StashSelectedButton
+        ) {
+            self.git_status.keyboard_focus = if delta < 0 {
+                GitKeyboardFocus::StashHeader
+            } else if self.git_status.stashes.is_empty() {
+                GitKeyboardFocus::Files
+            } else {
+                GitKeyboardFocus::Stashes
+            };
+            return;
+        }
+
+        let order = self.git_keyboard_focus_order();
+        let current = order
+            .iter()
+            .position(|focus| *focus == self.git_status.keyboard_focus)
+            .unwrap_or_else(|| order.len().saturating_sub(1));
+        let next = if delta < 0 {
+            current.saturating_sub(1)
+        } else if delta > 0 {
+            (current + 1).min(order.len().saturating_sub(1))
+        } else {
+            current
+        };
+        if let Some(focus) = order.get(next).copied() {
+            self.git_status.keyboard_focus = focus;
+            if focus == GitKeyboardFocus::Repository {
+                self.git_status.repo_selector_idx = self.selected_repo_idx().unwrap_or(0);
+            }
+            if focus == GitKeyboardFocus::Files && self.selected_file.is_none() {
+                self.navigate_files(0);
+            }
+        }
+    }
+
+    pub fn move_git_keyboard_focus_horizontal(&mut self, delta: i32) {
+        self.normalize_git_keyboard_focus();
+        let order = self.git_keyboard_focus_order();
+        let action_indices: Vec<usize> = order
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, focus)| match focus {
+                GitKeyboardFocus::CommitButton
+                | GitKeyboardFocus::StashButton
+                | GitKeyboardFocus::PushButton
+                | GitKeyboardFocus::PublishBranchButton
+                | GitKeyboardFocus::PullButton => Some(idx),
+                _ => None,
+            })
+            .collect();
+        let stash_option_indices: Vec<usize> = order
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, focus)| match focus {
+                GitKeyboardFocus::StashAllButton
+                | GitKeyboardFocus::StashTrackedButton
+                | GitKeyboardFocus::StashKeepIndexButton
+                | GitKeyboardFocus::StashStagedButton
+                | GitKeyboardFocus::StashSelectedButton => Some(idx),
+                _ => None,
+            })
+            .collect();
+        let indices = if stash_option_indices
+            .iter()
+            .any(|idx| order[*idx] == self.git_status.keyboard_focus)
+        {
+            stash_option_indices
+        } else {
+            action_indices
+        };
+        let Some(current_action_pos) = indices
+            .iter()
+            .position(|idx| order[*idx] == self.git_status.keyboard_focus)
+        else {
+            return;
+        };
+        let next_action_pos = if delta < 0 {
+            current_action_pos.saturating_sub(1)
+        } else if delta > 0 {
+            (current_action_pos + 1).min(indices.len().saturating_sub(1))
+        } else {
+            current_action_pos
+        };
+        if let Some(idx) = indices.get(next_action_pos) {
+            self.git_status.keyboard_focus = order[*idx];
+        }
+    }
+
+    pub fn activate_git_keyboard_focus(&mut self) {
+        self.normalize_git_keyboard_focus();
+        self.active_panel = Panel::Files;
+        match self.git_status.keyboard_focus {
+            GitKeyboardFocus::Repository => {
+                if self.repo_selector_effectively_open() {
+                    self.select_git_repo_at_idx(self.git_status.repo_selector_idx);
+                    self.git_status.repo_selector_open = false;
+                } else {
+                    self.git_status.repo_selector_open = true;
+                    self.git_status.repo_selector_idx = self.selected_repo_idx().unwrap_or(0);
+                }
+            }
+            GitKeyboardFocus::Branch => {
+                if self.git_status.branch_dropdown_open {
+                    let idx = self.git_status.branch_dropdown_idx;
+                    if idx == 0 {
+                        self.open_branch_create_dialog();
+                    } else if let Some(branch) =
+                        self.git_branch_dropdown_branches().get(idx - 1).cloned()
+                    {
+                        self.git_status.branch_dropdown_open = false;
+                        self.checkout_branch(&branch);
+                    }
+                } else if self.branch_name != "(detached)" {
+                    self.git_status.branch_dropdown_open = true;
+                    self.git_status.branch_dropdown_idx = 0;
+                }
+            }
+            GitKeyboardFocus::CommitMessage => {
+                self.git_status.commit_editing = true;
+            }
+            GitKeyboardFocus::CommitButton => self.run_commit(),
+            GitKeyboardFocus::StashHeader => {
+                self.git_status.stash_section_open = !self.git_status.stash_section_open;
+            }
+            GitKeyboardFocus::StashButton => self.prepare_stash_push(
+                StashPushOptions {
+                    message: self.default_stash_message(),
+                    include_untracked: true,
+                    keep_index: false,
+                    staged_only: false,
+                    paths: Vec::new(),
+                },
+                "all",
+            ),
+            GitKeyboardFocus::StashAllButton => self.prepare_stash_push(
+                StashPushOptions {
+                    message: self.default_stash_message(),
+                    include_untracked: true,
+                    keep_index: false,
+                    staged_only: false,
+                    paths: Vec::new(),
+                },
+                "all",
+            ),
+            GitKeyboardFocus::StashTrackedButton => self.prepare_stash_push(
+                StashPushOptions {
+                    message: self.default_stash_message(),
+                    include_untracked: false,
+                    keep_index: false,
+                    staged_only: false,
+                    paths: Vec::new(),
+                },
+                "tracked",
+            ),
+            GitKeyboardFocus::StashKeepIndexButton => self.prepare_stash_push(
+                StashPushOptions {
+                    message: self.default_stash_message(),
+                    include_untracked: true,
+                    keep_index: true,
+                    staged_only: false,
+                    paths: Vec::new(),
+                },
+                "keep-index",
+            ),
+            GitKeyboardFocus::StashStagedButton => self.prepare_stash_push(
+                StashPushOptions {
+                    message: self.default_stash_message(),
+                    include_untracked: false,
+                    keep_index: false,
+                    staged_only: true,
+                    paths: Vec::new(),
+                },
+                "staged",
+            ),
+            GitKeyboardFocus::StashSelectedButton => {
+                let Some(sel) = self.selected_file.as_ref() else {
+                    return;
+                };
+                self.prepare_stash_push(
+                    StashPushOptions {
+                        message: self.default_stash_message(),
+                        include_untracked: true,
+                        keep_index: false,
+                        staged_only: false,
+                        paths: vec![sel.path.clone()],
+                    },
+                    "selected",
+                )
+            }
+            GitKeyboardFocus::PushButton => {
+                self.git_status.confirm_push = true;
+                self.git_status.confirm_force_push = false;
+                self.git_status.push_error = None;
+            }
+            GitKeyboardFocus::PublishBranchButton => {
+                self.git_status.push_error = None;
+                self.run_publish_branch();
+            }
+            GitKeyboardFocus::PullButton => {
+                self.git_status.pull_error = None;
+                self.run_pull();
+            }
+            GitKeyboardFocus::Stashes => {
+                if let Some(stash_ref) = self.selected_stash_ref() {
+                    self.prepare_stash_apply(stash_ref, false, false);
+                }
+            }
+            GitKeyboardFocus::Files => {
+                if let Some(path) = self.selected_git_file_path() {
+                    self.pending_edit = Some(path);
+                }
+            }
+        }
+    }
+
+    pub fn selected_git_file_path(&self) -> Option<PathBuf> {
+        let sel = self.selected_file.as_ref()?;
+        let repo_root_rel = self.status_repo_root_rel()?;
+        Some(
+            self.backend
+                .workdir_path()
+                .join(repo_root_rel)
+                .join(&sel.path),
+        )
+    }
+
+    pub fn selected_stash_ref(&self) -> Option<String> {
+        self.git_status
+            .stashes
+            .get(self.git_status.selected_stash_idx)
+            .map(|entry| entry.stash_ref.clone())
+    }
+
+    pub fn default_stash_message(&self) -> String {
+        let branch = if self.branch_name.is_empty() {
+            "unknown"
+        } else {
+            &self.branch_name
+        };
+        format!("reef stash on {branch}")
+    }
+
+    fn refresh_after_stash_op(&mut self) {
+        self.selected_file = None;
+        self.diff_content = None;
+        self.git_status.stash_detail = None;
+        self.git_status_load.mark_stale();
+        self.diff_load.mark_stale();
+        self.graph_load.mark_stale();
+    }
+
+    pub fn load_selected_stash_detail(&mut self) {
+        let Some(stash_ref) = self.selected_stash_ref() else {
+            self.git_status.stash_detail = None;
+            self.stash_detail_load.invalidate();
+            return;
+        };
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            self.git_status.stash_detail = None;
+            self.stash_detail_load.invalidate();
+            return;
+        };
+        self.git_status.stash_detail = None;
+        let generation = self.stash_detail_load.begin();
+        self.tasks.load_stash_detail(
+            generation,
+            Arc::clone(&self.backend),
+            repo_root_rel,
+            stash_ref,
+        );
+    }
+
+    pub fn stash_current_changes(&mut self, options: StashPushOptions) {
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
+        match self.backend.stash_push_for(&repo_root_rel, &options) {
+            Ok(()) => {
+                self.git_status.stash_error = None;
+                self.toasts.push(Toast::info("Stashed changes".to_string()));
+                self.refresh_after_stash_op();
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.git_status.stash_error = Some(msg.clone());
+                self.toasts
+                    .push(Toast::error(format!("Stash failed: {msg}")));
+            }
+        }
+    }
+
+    pub fn prepare_stash_push(&mut self, options: StashPushOptions, label: &str) {
+        self.git_status.pending_stash_action = Some(PendingStashAction::Push {
+            options,
+            label: label.to_string(),
+        });
+        self.git_status.stash_error = None;
+    }
+
+    pub fn prepare_stash_apply(&mut self, stash_ref: String, pop: bool, reinstate_index: bool) {
+        let action = if pop {
+            PendingStashAction::Pop {
+                stash_ref,
+                reinstate_index,
+            }
+        } else {
+            PendingStashAction::Apply {
+                stash_ref,
+                reinstate_index,
+            }
+        };
+        if !self.staged_files.is_empty() || !self.unstaged_files.is_empty() {
+            self.git_status.pending_stash_action = Some(action);
+        } else {
+            self.run_stash_action(action);
+        }
+    }
+
+    pub fn confirm_stash_action(&mut self) {
+        if let Some(action) = self.git_status.pending_stash_action.take() {
+            self.run_stash_action(action);
+        }
+    }
+
+    pub fn cancel_stash_action(&mut self) {
+        self.git_status.pending_stash_action = None;
+    }
+
+    pub fn prepare_stash_drop(&mut self, stash_ref: String) {
+        self.git_status.pending_stash_action = Some(PendingStashAction::Drop { stash_ref });
+    }
+
+    fn run_stash_action(&mut self, action: PendingStashAction) {
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
+        let result = match &action {
+            PendingStashAction::Push { options, .. } => {
+                self.backend.stash_push_for(&repo_root_rel, options)
+            }
+            PendingStashAction::Apply {
+                stash_ref,
+                reinstate_index,
+            } => self
+                .backend
+                .stash_apply_for(&repo_root_rel, stash_ref, *reinstate_index),
+            PendingStashAction::Pop {
+                stash_ref,
+                reinstate_index,
+            } => self
+                .backend
+                .stash_pop_for(&repo_root_rel, stash_ref, *reinstate_index),
+            PendingStashAction::Drop { stash_ref } => {
+                self.backend.stash_drop_for(&repo_root_rel, stash_ref)
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.git_status.stash_error = None;
+                let label = match action {
+                    PendingStashAction::Push { .. } => "Stashed changes",
+                    PendingStashAction::Apply { .. } => "Applied stash",
+                    PendingStashAction::Pop { .. } => "Popped stash",
+                    PendingStashAction::Drop { .. } => "Dropped stash",
+                };
+                self.toasts.push(Toast::info(label.to_string()));
+                self.refresh_after_stash_op();
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.git_status.stash_error = Some(msg.clone());
+                self.toasts
+                    .push(Toast::error(format!("Stash operation failed: {msg}")));
+                self.git_status_load.mark_stale();
+            }
+        }
+    }
+
+    pub fn stash_branch_selected(&mut self, branch: &str) {
+        let branch = branch.trim();
+        if branch.is_empty() {
+            return;
+        }
+        let Some(stash_ref) = self.selected_stash_ref() else {
+            return;
+        };
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
+        match self
+            .backend
+            .stash_branch_for(&repo_root_rel, &stash_ref, branch)
+        {
+            Ok(()) => {
+                self.toasts
+                    .push(Toast::info(format!("Created branch {branch} from stash")));
+                self.refresh_after_stash_op();
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                self.git_status.stash_error = Some(msg.clone());
+                self.toasts
+                    .push(Toast::error(format!("Stash branch failed: {msg}")));
+            }
+        }
+    }
+
+    pub fn run_publish_branch(&mut self) {
+        if self.push_in_flight || !self.should_offer_publish_branch() {
+            return;
+        }
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
+        let operation = PushOperation::PublishBranch;
+        let backend = Arc::clone(&self.backend);
+        let (tx, rx) = mpsc::channel();
+        self.push_rx = Some(rx);
+        self.push_in_flight = true;
+        self.push_in_flight_kind = operation;
+        std::thread::spawn(move || {
+            let result = backend
+                .publish_branch_for(&repo_root_rel)
+                .map_err(|e| e.to_string());
+            let _ = tx.send((operation, result));
         });
     }
 
@@ -3570,6 +4467,177 @@ impl App {
         }
     }
 
+    pub fn run_merge_branch(&mut self, branch: &str) {
+        let branch = branch.trim();
+        if self.merge_in_flight || branch.is_empty() || branch == self.branch_name {
+            return;
+        }
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
+        let branch = branch.to_string();
+        let backend = Arc::clone(&self.backend);
+        let (tx, rx) = mpsc::channel();
+        self.merge_rx = Some(rx);
+        self.merge_in_flight = true;
+        std::thread::spawn(move || {
+            let result = backend
+                .merge_branch_for(&repo_root_rel, &branch)
+                .map_err(|e| e.to_string());
+            let _ = tx.send((branch, result));
+        });
+    }
+
+    pub fn refresh_containers(&mut self) {
+        let generation = self.containers_load.begin();
+        self.tasks
+            .refresh_containers(generation, Arc::clone(&self.backend));
+    }
+
+    pub fn select_container(&mut self, idx: usize) {
+        if self.containers.containers.is_empty() {
+            self.containers.selected_idx = 0;
+        } else {
+            self.containers.selected_idx = idx.min(self.containers.containers.len() - 1);
+        }
+    }
+
+    pub fn move_container_selection(&mut self, delta: isize) {
+        let len = self.containers.containers.len();
+        if len == 0 {
+            self.containers.selected_idx = 0;
+            return;
+        }
+        let current = self.containers.selected_idx.min(len - 1);
+        let next = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta as usize).min(len - 1)
+        };
+        self.containers.selected_idx = next;
+    }
+
+    pub fn selected_container(&self) -> Option<&ContainerInfo> {
+        self.containers.containers.get(self.containers.selected_idx)
+    }
+
+    pub fn run_container_action(&mut self, action: ContainerAction) {
+        if self.container_action_in_flight {
+            return;
+        }
+        let Some(container) = self.selected_container().cloned() else {
+            return;
+        };
+        let id = container.id.clone();
+        let name = if container.names.is_empty() {
+            short_container_id(&container.id).to_string()
+        } else {
+            container.names.clone()
+        };
+        let backend = Arc::clone(&self.backend);
+        let (tx, rx) = mpsc::channel();
+        self.container_action_rx = Some(rx);
+        self.container_action_in_flight = true;
+        std::thread::spawn(move || {
+            let result = backend
+                .container_action(&id, action)
+                .map_err(|e| e.to_string());
+            let _ = tx.send((name, action, result));
+        });
+    }
+
+    pub fn branch_create_base_choices(&self) -> Vec<String> {
+        let mut choices = Vec::new();
+        if !self.branch_name.is_empty() && self.branch_name != "(detached)" {
+            choices.push(self.branch_name.clone());
+        }
+        for branch in &self.git_status.branches {
+            if !choices.iter().any(|existing| existing == branch) {
+                choices.push(branch.clone());
+            }
+        }
+        choices
+    }
+
+    pub fn open_branch_create_dialog(&mut self) {
+        self.git_status.branch_dropdown_open = false;
+        self.git_status.branch_create_dialog = Some(BranchCreateDialog::choose_mode());
+    }
+
+    pub fn cancel_branch_create_dialog(&mut self) {
+        self.git_status.branch_create_dialog = None;
+    }
+
+    pub fn start_branch_create_from_current(&mut self) {
+        if let Some(dialog) = self.git_status.branch_create_dialog.as_mut() {
+            dialog.step = BranchCreateStep::EnterName { base: None };
+            dialog.input.clear();
+            dialog.cursor = 0;
+            dialog.error = None;
+        }
+    }
+
+    pub fn start_branch_create_choose_base(&mut self) {
+        if let Some(dialog) = self.git_status.branch_create_dialog.as_mut() {
+            dialog.step = BranchCreateStep::ChooseBase;
+            dialog.selected_base_idx = 0;
+            dialog.error = None;
+        }
+    }
+
+    pub fn select_branch_create_base(&mut self, idx: usize) {
+        let Some(base) = self.branch_create_base_choices().get(idx).cloned() else {
+            return;
+        };
+        if let Some(dialog) = self.git_status.branch_create_dialog.as_mut() {
+            dialog.step = BranchCreateStep::EnterName { base: Some(base) };
+            dialog.input.clear();
+            dialog.cursor = 0;
+            dialog.error = None;
+        }
+    }
+
+    pub fn submit_branch_create_dialog(&mut self) {
+        let Some(dialog) = self.git_status.branch_create_dialog.as_ref() else {
+            return;
+        };
+        let branch = dialog.input.trim().to_string();
+        if branch.is_empty() {
+            if let Some(dialog) = self.git_status.branch_create_dialog.as_mut() {
+                dialog.error = Some(crate::i18n::branch_create_empty_name());
+            }
+            return;
+        }
+        let base = match &dialog.step {
+            BranchCreateStep::EnterName { base } => base.clone(),
+            _ => return,
+        };
+        let Some(repo_root_rel) = self.status_repo_root_rel() else {
+            return;
+        };
+        match self
+            .backend
+            .create_branch_for(&repo_root_rel, &branch, base.as_deref())
+        {
+            Ok(()) => {
+                self.git_status.branch_create_dialog = None;
+                self.selected_file = None;
+                self.diff_content = None;
+                self.git_status.confirm_discard = None;
+                self.clear_graph_snapshot();
+                self.refresh_status();
+                self.graph_load.invalidate_stale();
+                self.toasts
+                    .push(Toast::info(crate::i18n::branch_created_toast(&branch)));
+            }
+            Err(e) => {
+                if let Some(dialog) = self.git_status.branch_create_dialog.as_mut() {
+                    dialog.error = Some(crate::i18n::branch_create_failed(&e.to_string()));
+                }
+            }
+        }
+    }
+
     /// Called from `tick()`. If the push worker has posted a result, fold
     /// it into App state (toast + push_error banner + graph-cache bust +
     /// status refresh) and drop the channel. If the worker dropped its
@@ -3581,23 +4649,29 @@ impl App {
             return;
         };
         match rx.try_recv() {
-            Ok((force, result)) => {
+            Ok((operation, result)) => {
                 self.push_in_flight = false;
                 self.push_rx = None;
                 match result {
                     Ok(()) => {
                         use crate::i18n::{Msg, t};
                         self.git_status.push_error = None;
-                        self.toasts.push(Toast::info(if force {
-                            t(Msg::ForcePushSuccess)
-                        } else {
-                            t(Msg::PushSuccess)
+                        self.toasts.push(Toast::info(match operation {
+                            PushOperation::Push { force: true } => t(Msg::ForcePushSuccess),
+                            PushOperation::Push { force: false } => t(Msg::PushSuccess),
+                            PushOperation::PublishBranch => t(Msg::PublishBranchSuccess),
                         }));
                     }
                     Err(e) => {
+                        self.git_status.push_error_kind = operation;
                         self.git_status.push_error = Some(e.clone());
-                        self.toasts
-                            .push(Toast::error(crate::i18n::push_failed_toast(&e)));
+                        let toast = match operation {
+                            PushOperation::PublishBranch => {
+                                crate::i18n::publish_branch_failed_toast(&e)
+                            }
+                            PushOperation::Push { .. } => crate::i18n::push_failed_toast(&e),
+                        };
+                        self.toasts.push(Toast::error(toast));
                     }
                 }
                 // Push advances remote-tracking refs — mark git/graph data
@@ -3657,6 +4731,72 @@ impl App {
                 self.toasts.push(Toast::error(crate::i18n::t(
                     crate::i18n::Msg::PullThreadCrashed,
                 )));
+            }
+        }
+    }
+
+    fn drain_merge_result(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(rx) = self.merge_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((branch, result)) => {
+                self.merge_in_flight = false;
+                self.merge_rx = None;
+                match result {
+                    Ok(()) => {
+                        self.toasts
+                            .push(Toast::info(crate::i18n::branch_merged_toast(&branch)));
+                    }
+                    Err(e) => {
+                        self.toasts
+                            .push(Toast::error(crate::i18n::branch_merge_failed_toast(&e)));
+                    }
+                }
+                self.selected_file = None;
+                self.diff_content = None;
+                self.git_status.confirm_discard = None;
+                self.git_graph.cache_key = None;
+                self.git_status_load.mark_stale();
+                self.diff_load.mark_stale();
+                self.graph_load.mark_stale();
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.merge_in_flight = false;
+                self.merge_rx = None;
+                self.toasts
+                    .push(Toast::error(crate::i18n::branch_merge_thread_crashed()));
+            }
+        }
+    }
+
+    fn drain_container_action_result(&mut self) {
+        use std::sync::mpsc::TryRecvError;
+        let Some(rx) = self.container_action_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((name, action, result)) => {
+                self.container_action_in_flight = false;
+                self.container_action_rx = None;
+                match result {
+                    Ok(()) => self.toasts.push(Toast::info(
+                        crate::i18n::container_action_success(action.label(), &name),
+                    )),
+                    Err(e) => self.toasts.push(Toast::error(
+                        crate::i18n::container_action_failed(action.label(), &e),
+                    )),
+                }
+                self.containers_load.mark_stale();
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.container_action_in_flight = false;
+                self.container_action_rx = None;
+                self.toasts
+                    .push(Toast::error(crate::i18n::container_action_thread_crashed()));
             }
         }
     }
@@ -3800,94 +4940,9 @@ impl App {
                             (self.preview_content.as_ref(), content.as_ref()),
                             (Some(old), Some(new)) if old.file_path == new.file_path
                         );
-                        // Decide the protocol fate in three buckets:
-                        //
-                        // 1. Same-file re-load where old and new are both
-                        //    images with identical (bytes_on_disk, w, h,
-                        //    format) — a conservative "pixels probably
-                        //    didn't change" heuristic that covers
-                        //    re-selecting the same file. Keep the existing
-                        //    protocol so ratatui-image doesn't re-encode
-                        //    and the UI doesn't flicker.
-                        // 2. Other Image bodies — build a fresh protocol
-                        //    by moving the decoded `DynamicImage` out of
-                        //    the worker payload (so we don't keep two
-                        //    copies of the pixels alive).
-                        // 3. Non-image bodies or no picker — drop any
-                        //    stale protocol so we don't keep a previous
-                        //    image lingering.
-                        let reuse_protocol = same_file
-                            && self.preview_image_protocol.is_some()
-                            && matches!(
-                                (
-                                    self.preview_content.as_ref().map(|c| &c.body),
-                                    content.as_ref().map(|c| &c.body),
-                                ),
-                                (
-                                    Some(crate::file_tree::PreviewBody::Image(old)),
-                                    Some(crate::file_tree::PreviewBody::Image(new)),
-                                ) if old.bytes_on_disk == new.bytes_on_disk
-                                    && old.width_px == new.width_px
-                                    && old.height_px == new.height_px
-                                    && old.format == new.format
-                            );
-                        if !reuse_protocol {
-                            // Two-step protocol swap-in:
-                            //   1. Immediately install an EMPTY
-                            //      ThreadProtocol so render can already
-                            //      enter the image branch (it no-ops on
-                            //      the image area until inner lands).
-                            //   2. Spawn a one-shot thread to run
-                            //      `Picker::new_resize_protocol` — that
-                            //      call hashes the full decoded image
-                            //      which on a 2048² RGBA is ~16-30 ms
-                            //      of main-thread work we can't afford
-                            //      during a frame. Result flows back
-                            //      via `preview_build_tx` and gets
-                            //      merged in `drain_preview_protocol_builds`.
-                            let dyn_img = match (
-                                self.image_picker.as_ref(),
-                                content.as_mut().map(|c| &mut c.body),
-                            ) {
-                                (Some(_), Some(crate::file_tree::PreviewBody::Image(img))) => {
-                                    img.image.take()
-                                }
-                                _ => None,
-                            };
-                            if let (Some(dyn_img), Some(picker)) =
-                                (dyn_img, self.image_picker.as_ref())
-                            {
-                                self.preview_image_protocol =
-                                    Some(ratatui_image::thread::ThreadProtocol::new(
-                                        self.preview_resize_tx.clone(),
-                                        None,
-                                    ));
-                                self.preview_image_protocol_builds += 1;
-                                let picker_clone = picker.clone();
-                                let build_tx = self.preview_build_tx.clone();
-                                let build_gen = generation;
-                                std::thread::Builder::new()
-                                    .name("reef-image-build".into())
-                                    .spawn(move || {
-                                        let proto = picker_clone.new_resize_protocol(dyn_img);
-                                        let _ = build_tx.send(BuiltProtocol {
-                                            generation: build_gen,
-                                            protocol: proto,
-                                        });
-                                    })
-                                    .ok();
-                            } else {
-                                // Non-image body, or no picker available.
-                                self.preview_image_protocol = None;
-                            }
-                        } else if let Some(crate::file_tree::PreviewBody::Image(img)) =
-                            content.as_mut().map(|c| &mut c.body)
-                        {
-                            // Drop the new DynamicImage — the kept
-                            // protocol already has its own copy.
-                            img.image = None;
-                        }
+                        self.apply_preview_image_protocol(generation, content.as_mut());
                         self.preview_content = content;
+                        self.queue_preview_followups(generation);
                         if !same_file {
                             self.preview_scroll = 0;
                             self.preview_h_scroll = 0;
@@ -3967,14 +5022,46 @@ impl App {
                     }
                 }
             },
+            WorkerResult::PreviewHighlight {
+                generation,
+                file_path,
+                highlighted,
+            } => {
+                if generation == self.preview_load.generation
+                    && let Some(preview) = self.preview_content.as_mut()
+                    && preview.file_path == file_path
+                    && let PreviewBody::Text {
+                        highlighted: current,
+                        ..
+                    } = &mut preview.body
+                {
+                    *current = highlighted;
+                }
+            }
+            WorkerResult::PreviewImageDecoded { generation, result } => {
+                if generation == self.preview_load.generation
+                    && let Ok(Some(mut decoded)) = result
+                    && let Some(preview) = self.preview_content.as_ref()
+                    && preview.file_path == decoded.file_path
+                {
+                    self.apply_preview_image_protocol(generation, Some(&mut decoded));
+                    self.preview_content = Some(decoded);
+                }
+            }
             WorkerResult::GitStatus { generation, result } => match result {
                 Ok(payload) => {
                     if self.git_status_load.complete_ok(generation) {
                         let before = self.selected_file.clone();
+                        let previous_stashes = self.git_status.stashes.clone();
+                        let previous_selected_stash_ref = self.selected_stash_ref();
                         self.staged_files = payload.staged;
                         self.unstaged_files = payload.unstaged;
                         self.git_status.ahead_behind = payload.ahead_behind;
                         self.git_status.branches = payload.branches;
+                        self.git_status.stashes = payload.stashes;
+                        if self.git_status.selected_stash_idx >= self.git_status.stashes.len() {
+                            self.git_status.selected_stash_idx = 0;
+                        }
                         self.branch_name = payload.branch_name;
 
                         self.file_tree
@@ -3996,10 +5083,57 @@ impl App {
                         if before != self.selected_file {
                             self.load_diff();
                         }
+                        let stashes_changed = self.git_status.stashes != previous_stashes;
+                        let selected_stash_ref_changed =
+                            self.selected_stash_ref() != previous_selected_stash_ref;
+                        if !self.git_status.stashes.is_empty()
+                            && (stashes_changed
+                                || selected_stash_ref_changed
+                                || (self.git_status.stash_detail.is_none()
+                                    && !self.stash_detail_load.loading))
+                        {
+                            self.load_selected_stash_detail();
+                        } else if self.git_status.stashes.is_empty()
+                            && (stashes_changed
+                                || self.git_status.stash_detail.is_some()
+                                || self.stash_detail_load.loading)
+                        {
+                            self.git_status.stash_detail = None;
+                            self.stash_detail_load.invalidate();
+                        }
                     }
                 }
                 Err(error) => {
                     self.git_status_load.complete_err(generation, error);
+                }
+            },
+            WorkerResult::Containers { generation, result } => match result {
+                Ok(payload) => {
+                    if self.containers_load.complete_ok(generation) {
+                        self.containers.containers = payload.containers;
+                        if self.containers.selected_idx >= self.containers.containers.len() {
+                            self.containers.selected_idx =
+                                self.containers.containers.len().saturating_sub(1);
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.containers_load.complete_err(generation, error);
+                }
+            },
+            WorkerResult::StashDetail { generation, result } => match result {
+                Ok(detail) => {
+                    if self.stash_detail_load.complete_ok(generation) {
+                        self.git_status.stash_detail = Some(detail);
+                    }
+                }
+                Err(error) => {
+                    if self
+                        .stash_detail_load
+                        .complete_err(generation, error.clone())
+                    {
+                        self.git_status.stash_error = Some(error);
+                    }
                 }
             },
             WorkerResult::Diff { generation, result } => match result {
@@ -4360,9 +5494,13 @@ impl App {
         // 3-col diff column share this state, and tab-switching between
         // them (or to Files/Search) should start fresh.
         self.clear_diff_selection();
+        if tab == Tab::Git {
+            self.active_panel = Panel::Files;
+        }
         match tab {
             Tab::Git => self.git_status_load.mark_stale(),
             Tab::Graph => self.graph_load.mark_stale(),
+            Tab::Containers => self.containers_load.mark_stale(),
             Tab::Files => {
                 if self.file_tree.entries.is_empty() {
                     self.file_tree_load.mark_stale();
@@ -4401,6 +5539,7 @@ impl App {
             Tab::Graph => from_state("graph", &self.graph_load)
                 .or_else(|| from_state("commit", &self.commit_detail_load))
                 .or_else(|| from_state("commit diff", &self.commit_file_diff_load)),
+            Tab::Containers => from_state("containers", &self.containers_load),
             // Search activity is surfaced in the tab's own footer (`N / M ·
             // scanning…`), not in the global status bar.
             Tab::Search => {
@@ -4420,6 +5559,9 @@ impl App {
             }
             ClickAction::ToggleSidebar => {
                 self.toggle_sidebar();
+            }
+            ClickAction::ContainerSelect(index) => {
+                self.select_container(index);
             }
             ClickAction::TreeClick(index) => {
                 self.file_tree.selected = index;
@@ -4685,6 +5827,7 @@ impl App {
         let (path, staged) = items[new_idx].clone();
         // Defer `load_diff()` to main.rs after the event-drain loop so rapid
         // key repeats coalesce into a single diff load.
+        self.git_status.keyboard_focus = GitKeyboardFocus::Files;
         self.selected_file = Some(SelectedFile {
             path,
             is_staged: staged,
@@ -4729,6 +5872,8 @@ impl App {
         self.drain_preview_protocol_builds();
         self.drain_push_result();
         self.drain_pull_result();
+        self.drain_merge_result();
+        self.drain_container_action_result();
         self.drain_commit_result();
         self.kick_active_tab_work();
         self.tick_place_mode_auto_expand();
@@ -4948,6 +6093,11 @@ impl App {
                     self.load_preview_for_path(hit.path);
                 }
             }
+            Tab::Containers => {
+                if self.containers_load.should_request() {
+                    self.refresh_containers();
+                }
+            }
         }
     }
 }
@@ -5004,7 +6154,7 @@ mod tests {
 
     #[test]
     fn graph_state_selected_range_collapsed_anchor_is_single() {
-        // `V` just entered visual mode — anchor sits on the cursor.
+        // Ctrl+Alt+V just entered visual mode — anchor sits on the cursor.
         let g = GitGraphState {
             selected_idx: 3,
             selection_anchor: Some(3),

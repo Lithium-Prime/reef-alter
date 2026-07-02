@@ -1,13 +1,13 @@
-# @reef-tui/cli
+# @lithium-prime/reef-alter
 
 Reef — a terminal UI for Git and code review.
 
 ## Install
 
 ```sh
-npm install -g @reef-tui/cli
+npm install -g @lithium-prime/reef-alter
 # or run directly
-npx @reef-tui/cli
+npx @lithium-prime/reef-alter
 ```
 
 ## Usage
@@ -16,7 +16,7 @@ npx @reef-tui/cli
 reef
 ```
 
-See the [project README](https://github.com/Blushyes/reef#readme) for full documentation.
+See the [project README](https://github.com/Lithium-Prime/reef-with-multi-git-repo#readme) for full documentation.
 
 ## Supported platforms
 

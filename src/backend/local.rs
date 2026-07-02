@@ -13,9 +13,10 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock, mpsc};
 
 use super::{
-    Backend, BackendError, ContentMatchHit, ContentSearchCompleted, ContentSearchRequest,
-    EditorLaunchSpec, RepoDiscoverOpts, RepoDiscoverResponse, SearchChunkSink, StatusSnapshot,
-    TrashOutcome, WalkOpts, WalkResponse, WorkspaceRepoMeta, normalize_repo_root_rel,
+    Backend, BackendError, ContainerAction, ContainerInfo, ContainerState, ContentMatchHit,
+    ContentSearchCompleted, ContentSearchRequest, EditorLaunchSpec, RepoDiscoverOpts,
+    RepoDiscoverResponse, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
+    WorkspaceRepoMeta, normalize_repo_root_rel,
 };
 use crate::file_tree::{self, PreviewContent, TreeEntry};
 use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, GitRepo, RefLabel};
@@ -28,6 +29,7 @@ use std::ops::ControlFlow;
 /// so a full cache is bounded at ~128 MB worst-case but usually much
 /// smaller (text files are tiny, most images are small).
 const PREVIEW_CACHE_CAP: usize = 8;
+const PREVIEW_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Key shape that makes cache hits correct across:
 /// - file edits (`mtime_ns` changes → miss → fresh decode)
@@ -49,23 +51,31 @@ struct PreviewCache {
     /// Front = least-recently-used, back = most. Eight linear-scan
     /// lookups per load is far cheaper than a PNG decode, so we don't
     /// bother with a hash index.
-    entries: VecDeque<(PreviewCacheKey, PreviewContent)>,
+    entries: VecDeque<(PreviewCacheKey, PreviewContent, usize)>,
+    total_bytes: usize,
 }
 
 impl PreviewCache {
     fn get(&mut self, key: &PreviewCacheKey) -> Option<PreviewContent> {
-        let pos = self.entries.iter().position(|(k, _)| k == key)?;
-        let (k, v) = self.entries.remove(pos).expect("position checked");
+        let pos = self.entries.iter().position(|(k, _, _)| k == key)?;
+        let (k, v, weight) = self.entries.remove(pos).expect("position checked");
         let cloned = v.clone();
-        self.entries.push_back((k, v));
+        self.entries.push_back((k, v, weight));
         Some(cloned)
     }
 
     fn put(&mut self, key: PreviewCacheKey, value: PreviewContent) {
-        while self.entries.len() >= PREVIEW_CACHE_CAP {
-            self.entries.pop_front();
+        let weight = value.memory_weight_bytes();
+        while self.entries.len() >= PREVIEW_CACHE_CAP
+            || (!self.entries.is_empty()
+                && self.total_bytes.saturating_add(weight) > PREVIEW_CACHE_BYTES)
+        {
+            if let Some((_, _, removed_weight)) = self.entries.pop_front() {
+                self.total_bytes = self.total_bytes.saturating_sub(removed_weight);
+            }
         }
-        self.entries.push_back((key, value));
+        self.total_bytes = self.total_bytes.saturating_add(weight);
+        self.entries.push_back((key, value, weight));
     }
 }
 
@@ -413,6 +423,14 @@ impl Backend for LocalBackend {
         Ok(discover_repos_local(&self.workdir, opts))
     }
 
+    fn list_containers(&self) -> Result<Vec<ContainerInfo>, BackendError> {
+        list_containers_local()
+    }
+
+    fn container_action(&self, id: &str, action: ContainerAction) -> Result<(), BackendError> {
+        container_action_local(id, action)
+    }
+
     fn build_file_tree(
         &self,
         expanded: &HashSet<PathBuf>,
@@ -652,6 +670,14 @@ impl Backend for LocalBackend {
         crate::git::push_at(&self.workdir_at(repo_root_rel)?, force).map_err(BackendError::Git)
     }
 
+    fn publish_branch(&self) -> Result<(), BackendError> {
+        self.publish_branch_for(Path::new("."))
+    }
+
+    fn publish_branch_for(&self, repo_root_rel: &Path) -> Result<(), BackendError> {
+        crate::git::publish_branch_at(&self.workdir_at(repo_root_rel)?).map_err(BackendError::Git)
+    }
+
     fn pull(&self) -> Result<(), BackendError> {
         self.pull_for(Path::new("."))
     }
@@ -666,6 +692,117 @@ impl Backend for LocalBackend {
 
     fn checkout_branch_for(&self, repo_root_rel: &Path, branch: &str) -> Result<(), BackendError> {
         crate::git::checkout_branch_at(&self.workdir_at(repo_root_rel)?, branch)
+            .map_err(BackendError::Git)
+    }
+
+    fn create_branch(&self, branch: &str, base: Option<&str>) -> Result<(), BackendError> {
+        self.create_branch_for(Path::new("."), branch, base)
+    }
+
+    fn create_branch_for(
+        &self,
+        repo_root_rel: &Path,
+        branch: &str,
+        base: Option<&str>,
+    ) -> Result<(), BackendError> {
+        crate::git::create_branch_at(&self.workdir_at(repo_root_rel)?, branch, base)
+            .map_err(BackendError::Git)
+    }
+
+    fn merge_branch(&self, branch: &str) -> Result<(), BackendError> {
+        self.merge_branch_for(Path::new("."), branch)
+    }
+
+    fn merge_branch_for(&self, repo_root_rel: &Path, branch: &str) -> Result<(), BackendError> {
+        crate::git::merge_branch_at(&self.workdir_at(repo_root_rel)?, branch)
+            .map_err(BackendError::Git)
+    }
+
+    fn list_stashes(&self) -> Result<Vec<crate::git::StashEntry>, BackendError> {
+        self.list_stashes_for(Path::new("."))
+    }
+
+    fn list_stashes_for(
+        &self,
+        repo_root_rel: &Path,
+    ) -> Result<Vec<crate::git::StashEntry>, BackendError> {
+        crate::git::list_stashes_at(&self.workdir_at(repo_root_rel)?).map_err(BackendError::Git)
+    }
+
+    fn stash_detail(&self, stash_ref: &str) -> Result<crate::git::StashDetail, BackendError> {
+        self.stash_detail_for(Path::new("."), stash_ref)
+    }
+
+    fn stash_detail_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+    ) -> Result<crate::git::StashDetail, BackendError> {
+        crate::git::stash_detail_at(&self.workdir_at(repo_root_rel)?, stash_ref)
+            .map_err(BackendError::Git)
+    }
+
+    fn stash_push(&self, options: &crate::git::StashPushOptions) -> Result<(), BackendError> {
+        self.stash_push_for(Path::new("."), options)
+    }
+
+    fn stash_push_for(
+        &self,
+        repo_root_rel: &Path,
+        options: &crate::git::StashPushOptions,
+    ) -> Result<(), BackendError> {
+        crate::git::stash_push_at(&self.workdir_at(repo_root_rel)?, options)
+            .map_err(BackendError::Git)
+    }
+
+    fn stash_apply(&self, stash_ref: &str, reinstate_index: bool) -> Result<(), BackendError> {
+        self.stash_apply_for(Path::new("."), stash_ref, reinstate_index)
+    }
+
+    fn stash_apply_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+        reinstate_index: bool,
+    ) -> Result<(), BackendError> {
+        crate::git::stash_apply_at(&self.workdir_at(repo_root_rel)?, stash_ref, reinstate_index)
+            .map_err(BackendError::Git)
+    }
+
+    fn stash_pop(&self, stash_ref: &str, reinstate_index: bool) -> Result<(), BackendError> {
+        self.stash_pop_for(Path::new("."), stash_ref, reinstate_index)
+    }
+
+    fn stash_pop_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+        reinstate_index: bool,
+    ) -> Result<(), BackendError> {
+        crate::git::stash_pop_at(&self.workdir_at(repo_root_rel)?, stash_ref, reinstate_index)
+            .map_err(BackendError::Git)
+    }
+
+    fn stash_drop(&self, stash_ref: &str) -> Result<(), BackendError> {
+        self.stash_drop_for(Path::new("."), stash_ref)
+    }
+
+    fn stash_drop_for(&self, repo_root_rel: &Path, stash_ref: &str) -> Result<(), BackendError> {
+        crate::git::stash_drop_at(&self.workdir_at(repo_root_rel)?, stash_ref)
+            .map_err(BackendError::Git)
+    }
+
+    fn stash_branch(&self, stash_ref: &str, branch: &str) -> Result<(), BackendError> {
+        self.stash_branch_for(Path::new("."), stash_ref, branch)
+    }
+
+    fn stash_branch_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+        branch: &str,
+    ) -> Result<(), BackendError> {
+        crate::git::stash_branch_at(&self.workdir_at(repo_root_rel)?, stash_ref, branch)
             .map_err(BackendError::Git)
     }
 
@@ -1206,6 +1343,97 @@ fn truncate_to_chars(text: &str, max_chars: usize) -> Cow<'_, str> {
         Cow::Borrowed(text)
     } else {
         Cow::Owned(text[..byte_end].to_string())
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ContainerPsRow {
+    id: String,
+    image: String,
+    command: String,
+    created_at: String,
+    status: String,
+    names: String,
+    ports: String,
+    state: String,
+}
+
+fn container_runtime() -> Result<&'static str, BackendError> {
+    for bin in ["docker", "podman"] {
+        match std::process::Command::new(bin).arg("--version").output() {
+            Ok(output) if output.status.success() => return Ok(bin),
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(BackendError::Io(format!("run {bin}: {e}"))),
+        }
+    }
+    Err(BackendError::Unimplemented(
+        "container runtime not found on PATH (tried docker, podman)".to_string(),
+    ))
+}
+
+fn list_containers_local() -> Result<Vec<ContainerInfo>, BackendError> {
+    let runtime = container_runtime()?;
+    let output = std::process::Command::new(runtime)
+        .args(["ps", "-a", "--no-trunc", "--format", "{{json .}}"])
+        .output()
+        .map_err(|e| BackendError::Io(format!("run {runtime} ps: {e}")))?;
+    if !output.status.success() {
+        return Err(BackendError::Other(command_error(runtime, "ps", &output)));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut containers = Vec::new();
+    for line in stdout.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let row: ContainerPsRow = serde_json::from_str(line)
+            .map_err(|e| BackendError::Protocol(format!("decode {runtime} ps row: {e}")))?;
+        containers.push(ContainerInfo {
+            id: row.id,
+            image: row.image,
+            command: row.command,
+            created: row.created_at,
+            status: row.status,
+            names: row.names,
+            ports: row.ports,
+            state: ContainerState::from_docker_state(&row.state),
+        });
+    }
+    Ok(containers)
+}
+
+fn container_action_local(id: &str, action: ContainerAction) -> Result<(), BackendError> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err(BackendError::Other("container id cannot be empty".to_string()));
+    }
+    if id.starts_with('-') || id.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(BackendError::Other("invalid container id".to_string()));
+    }
+    let runtime = container_runtime()?;
+    let output = std::process::Command::new(runtime)
+        .args([action.command(), id])
+        .output()
+        .map_err(|e| BackendError::Io(format!("run {runtime} {}: {e}", action.command())))?;
+    if !output.status.success() {
+        return Err(BackendError::Other(command_error(
+            runtime,
+            action.command(),
+            &output,
+        )));
+    }
+    Ok(())
+}
+
+fn command_error(runtime: &str, op: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("{runtime} {op} failed")
     }
 }
 

@@ -1,11 +1,11 @@
 ---
 name: releasing-reef
-description: How to cut a reef release — version bump, tag push, and the GitHub Release notes format. Use when the user says "cut a release", "tag vX.Y.Z", "打个 tag 发布", "发布", "bump version", "release notes", or asks "how do I release reef", "what's the notes format", "is it safe to push this tag". Covers the full pipeline pushing a `v*` tag triggers (multi-platform binary build + npm publish to `@reef-tui/cli` + GitHub Release with assets), the notes convention, and the specific traps we've paid for — Cargo.toml drift, shell escaping when passing notes inline, and how `softprops/action-gh-release` behaves with pre-existing release bodies.
+description: How to cut a reef release — version bump, tag push, and the GitHub Release notes format. Use when the user says "cut a release", "tag vX.Y.Z", "打个 tag 发布", "发布", "bump version", "release notes", or asks "how do I release reef", "what's the notes format", "is it safe to push this tag". Covers the full pipeline pushing a `v*` tag triggers (multi-platform binary build + npm publish to `@lithium-prime/reef-alter` + GitHub Release with assets), the notes convention, and the specific traps we've paid for — Cargo.toml drift, shell escaping when passing notes inline, and how `softprops/action-gh-release` behaves with pre-existing release bodies.
 ---
 
 # Releasing reef
 
-Reef releases are driven by **git tags matching `v*`**. Pushing such a tag is the single trigger for `.github/workflows/release.yml`, which does the rest automatically: `reef` + `reef-agent` binaries for five targets, npm publish of `@reef-tui/cli` + five platform subpackages, GitHub Release with assets. You never run `cargo publish`, never `npm publish` by hand, never upload binaries manually. The contract is **bump Cargo.toml, commit, tag, push**.
+Reef releases are driven by **git tags matching `v*`**. Pushing such a tag is the single trigger for `.github/workflows/release.yml`, which does the rest automatically: `reef` + `reef-agent` binaries for five targets, npm publish of `@lithium-prime/reef-alter` + five platform subpackages, GitHub Release with assets. You never run `cargo publish`, never `npm publish` by hand, never upload binaries manually. The contract is **bump Cargo.toml, commit, tag, push**.
 
 ## What a `v*` tag push actually runs
 
@@ -17,8 +17,8 @@ Reef releases are driven by **git tags matching `v*`**. Pushing such a tag is th
    - `x86_64-pc-windows-msvc`
 
    Each row uploads two artifacts: `reef-<platform>` and `reef-agent-<platform>`.
-2. **npm platform subpackages** — publishes `@reef-tui/cli-{darwin-arm64,darwin-x64,linux-arm64,linux-x64,win32-x64}`. Each subpackage bundles **only the `reef` binary** (the agent is embedded inside it). Each subpackage's `package.json` version is overwritten at publish time to `${TAG#v}`.
-3. **npm main package** — publishes `@reef-tui/cli` with `optionalDependencies` pinned to the same version.
+2. **npm platform subpackages** — publishes `@lithium-prime/reef-alter-{darwin-arm64,darwin-x64,linux-arm64,linux-x64,win32-x64}`. Each subpackage bundles **only the `reef` binary** (the agent is embedded inside it). Each subpackage's `package.json` version is overwritten at publish time to `${TAG#v}`.
+3. **npm main package** — publishes `@lithium-prime/reef-alter` with `optionalDependencies` pinned to the same version.
 4. **GitHub Release** — via `softprops/action-gh-release@v2`:
    - Attaches ten archives — `reef-{darwin-arm64,darwin-x64,linux-arm64,linux-x64}.tar.gz` + `reef-win32-x64.zip`, and the same set prefixed `reef-agent-`. The standalone agent archives are for users running it outside the upload-fallback path (e.g. preseeding it on a remote host).
    - Has `generate_release_notes: true` — this **appends** auto-generated `## What's Changed` notes to whatever body the release already has; it does not overwrite a pre-existing body.
@@ -111,7 +111,7 @@ Template (`/tmp/release-notes.md`):
 
 - Short description of the fix. Closes #ISSUE. (#PR)
 
-**Full changelog**: https://github.com/Blushyes/reef/compare/vPREV...vNEW
+**Full changelog**: https://github.com/Lithium-Prime/reef-with-multi-git-repo/compare/vPREV...vNEW
 ```
 
 Rules:
@@ -140,7 +140,7 @@ Example — the actual v0.5.0 notes we shipped:
 - Scrolling is no longer trapped on the opened file in the **Files** tab — the mouse wheel now scrolls the tree freely again. Closes #10. (#13)
 - Same fix applied to the **Graph** tab so the commit list scroll isn't snapped back to the selected commit. (#14)
 
-**Full changelog**: https://github.com/Blushyes/reef/compare/v0.4.0...v0.5.0
+**Full changelog**: https://github.com/Lithium-Prime/reef-with-multi-git-repo/compare/v0.4.0...v0.5.0
 ```
 
 ## Post-release verification
@@ -148,8 +148,8 @@ Example — the actual v0.5.0 notes we shipped:
 ```bash
 gh run watch --exit-status                         # wait for release.yml to finish
 gh release view "${NEW}"                           # binaries all listed?
-npm view @reef-tui/cli version                     # matches ${NEW#v}?
-npm view @reef-tui/cli-darwin-arm64 version        # and subpackages
+npm view @lithium-prime/reef-alter version                     # matches ${NEW#v}?
+npm view @lithium-prime/reef-alter-darwin-arm64 version        # and subpackages
 ```
 
 Expected assets on the Release (**10 total**):
@@ -202,7 +202,7 @@ Does not require retagging or rebuilding.
 
 ### Don't delete a pushed tag to "undo"
 
-Deleting the tag from GitHub does not unpublish npm packages. If you catch a bad tag within 72h, `npm unpublish @reef-tui/cli@$VER` and each subpackage (5 of them). Beyond 72h, cut a patch release that reverts the offending commit — npm has no public unpublish after that window.
+Deleting the tag from GitHub does not unpublish npm packages. If you catch a bad tag within 72h, `npm unpublish @lithium-prime/reef-alter@$VER` and each subpackage (5 of them). Beyond 72h, cut a patch release that reverts the offending commit — npm has no public unpublish after that window.
 
 ### Prereleases
 

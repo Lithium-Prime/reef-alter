@@ -24,7 +24,10 @@ use std::sync::mpsc;
 
 use crate::file_tree::{PreviewContent, TreeEntry};
 use crate::git::graph::GraphRow;
-use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, RefLabel};
+use crate::git::{
+    CommitDetail, CommitInfo, DiffContent, FileEntry, RefLabel, StashDetail, StashEntry,
+    StashPushOptions,
+};
 use std::collections::{HashMap, HashSet};
 
 pub mod local;
@@ -32,6 +35,76 @@ pub mod remote;
 
 pub use local::LocalBackend;
 pub use remote::RemoteBackend;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerInfo {
+    pub id: String,
+    pub image: String,
+    pub command: String,
+    pub created: String,
+    pub status: String,
+    pub names: String,
+    pub ports: String,
+    pub state: ContainerState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerState {
+    Running,
+    Exited,
+    Paused,
+    Restarting,
+    Created,
+    Dead,
+    Other,
+}
+
+impl ContainerState {
+    pub fn from_docker_state(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "running" => Self::Running,
+            "exited" => Self::Exited,
+            "paused" => Self::Paused,
+            "restarting" => Self::Restarting,
+            "created" => Self::Created,
+            "dead" => Self::Dead,
+            _ => Self::Other,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Exited => "exited",
+            Self::Paused => "paused",
+            Self::Restarting => "restarting",
+            Self::Created => "created",
+            Self::Dead => "dead",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl ContainerAction {
+    pub fn command(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.command()
+    }
+}
 
 /// Errors returned by `Backend` operations. Kept deliberately simple — we
 /// fold git2/IO errors into strings at the boundary because the UI only
@@ -144,7 +217,7 @@ impl Default for RepoDiscoverOpts {
     fn default() -> Self {
         Self {
             max_depth: 2,
-            include_nested: false,
+            include_nested: true,
             max_repos: Some(100),
         }
     }
@@ -338,6 +411,10 @@ pub trait Backend: Send + Sync {
     fn discover_repos(&self, opts: &RepoDiscoverOpts)
     -> Result<RepoDiscoverResponse, BackendError>;
 
+    // ─── containers ────────────────────────────────────────────────────────
+    fn list_containers(&self) -> Result<Vec<ContainerInfo>, BackendError>;
+    fn container_action(&self, id: &str, action: ContainerAction) -> Result<(), BackendError>;
+
     // ─── filesystem ─────────────────────────────────────────────────────────
     /// Build the flat tree of entries for the backend's workdir. `expanded`
     /// is the set of directory paths (relative) the UI wants to show as
@@ -451,10 +528,58 @@ pub trait Backend: Send + Sync {
 
     fn push(&self, force: bool) -> Result<(), BackendError>;
     fn push_for(&self, repo_root_rel: &Path, force: bool) -> Result<(), BackendError>;
+    fn publish_branch(&self) -> Result<(), BackendError>;
+    fn publish_branch_for(&self, repo_root_rel: &Path) -> Result<(), BackendError>;
     fn pull(&self) -> Result<(), BackendError>;
     fn pull_for(&self, repo_root_rel: &Path) -> Result<(), BackendError>;
     fn checkout_branch(&self, branch: &str) -> Result<(), BackendError>;
     fn checkout_branch_for(&self, repo_root_rel: &Path, branch: &str) -> Result<(), BackendError>;
+    fn create_branch(&self, branch: &str, base: Option<&str>) -> Result<(), BackendError>;
+    fn create_branch_for(
+        &self,
+        repo_root_rel: &Path,
+        branch: &str,
+        base: Option<&str>,
+    ) -> Result<(), BackendError>;
+    fn merge_branch(&self, branch: &str) -> Result<(), BackendError>;
+    fn merge_branch_for(&self, repo_root_rel: &Path, branch: &str) -> Result<(), BackendError>;
+    fn list_stashes(&self) -> Result<Vec<StashEntry>, BackendError>;
+    fn list_stashes_for(&self, repo_root_rel: &Path) -> Result<Vec<StashEntry>, BackendError>;
+    fn stash_detail(&self, stash_ref: &str) -> Result<StashDetail, BackendError>;
+    fn stash_detail_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+    ) -> Result<StashDetail, BackendError>;
+    fn stash_push(&self, options: &StashPushOptions) -> Result<(), BackendError>;
+    fn stash_push_for(
+        &self,
+        repo_root_rel: &Path,
+        options: &StashPushOptions,
+    ) -> Result<(), BackendError>;
+    fn stash_apply(&self, stash_ref: &str, reinstate_index: bool) -> Result<(), BackendError>;
+    fn stash_apply_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+        reinstate_index: bool,
+    ) -> Result<(), BackendError>;
+    fn stash_pop(&self, stash_ref: &str, reinstate_index: bool) -> Result<(), BackendError>;
+    fn stash_pop_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+        reinstate_index: bool,
+    ) -> Result<(), BackendError>;
+    fn stash_drop(&self, stash_ref: &str) -> Result<(), BackendError>;
+    fn stash_drop_for(&self, repo_root_rel: &Path, stash_ref: &str) -> Result<(), BackendError>;
+    fn stash_branch(&self, stash_ref: &str, branch: &str) -> Result<(), BackendError>;
+    fn stash_branch_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+        branch: &str,
+    ) -> Result<(), BackendError>;
 
     /// Commit the staged index with `message`. Same shell-out rationale
     /// as `push` — respects hooks, signing, and the user's git config.

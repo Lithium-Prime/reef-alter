@@ -23,7 +23,7 @@
 - **Files**：文件树 + 只读预览——代码带语法高亮、图片内联渲染（自动检测 Kitty / iTerm2 / 半块字符三种协议之一）、二进制文件显示友好的元信息卡片。
 - **Search**：工作目录内容级搜索（基于 ripgrep，遵循 `.gitignore`），右栏活预览；列表 / 输入两态切换，整行水平滚动，结果上限 1000 条。
 - **Git**：status 带每个文件的 `+N −M` 统计；按文件**或按文件夹**暂存 / 取消暂存（键盘或双击）；unified / side-by-side diff；compact / full-file 上下文；语法高亮；带确认的单条还原和一次性全部还原；带确认横条的推送 / 强制推送（`--force-with-lease`）。
-- **Graph**：commit 图（DAG）+ 引用标签，内联 commit 详情与单文件 diff。vim 风格的 visual 模式（按 `V`）选一段 commit 区间并渲染整段的合并 diff；`Shift+↑/↓` 或 `Shift+Click` 可以不进 visual 模式直接扩选。
+- **Graph**：commit 图（DAG）+ 引用标签，内联 commit 详情与单文件 diff。visual 模式（按 `Ctrl+Alt+V`）选一段 commit 区间并渲染整段的合并 diff；`Shift+↑/↓` 或 `Shift+Click` 可以不进 visual 模式直接扩选。
 
 ### 浮层
 
@@ -55,7 +55,7 @@ reef --ssh user@host:/path      # 打开远端的 /path
 - **键盘优先**，鼠标只出现在真正值得的地方——拖动分隔条、双击切换暂存、在光标下的面板里滚动、右键文件树弹菜单。
 - **vim 风格的面板内搜索**：`/` 和 `?` 开提示符，`n` / `N` 跳匹配，提示符里支持 `Alt`/`Ctrl` 的词级编辑。
 - **导航键**：`↑` / `↓`、`j` / `k`、`Ctrl+P` / `Ctrl+N` / `Ctrl+K` / `Ctrl+J` 在每个标签里都能移动选择。
-- **选择 & 剪贴板**：`v` 关掉鼠标捕获让终端原生选择接管；或者直接在预览里拖选，Reef 通过 OSC 52 写进系统剪贴板（不用辅助二进制，SSH 上也行）。
+- **选择 & 剪贴板**：`Alt+V` 关掉鼠标捕获让终端原生选择接管；或者直接在预览里拖选，Reef 通过 OSC 52 写进系统剪贴板（不用辅助二进制，SSH 上也行）。
 - **自动主题**：OSC 11 探测终端明暗主题；语言自动检测（English / 简体中文）。
 - **记住偏好**：diff 布局、diff 模式、最近的 SSH 主机等跨会话保留。
 
@@ -65,10 +65,10 @@ reef --ssh user@host:/path      # 打开远端的 /path
 
 ```bash
 # 直接运行，不装
-npx @reef-tui/cli
+npx @lithium-prime/reef-alter
 
 # 或者全局装
-npm install -g @reef-tui/cli
+npm install -g @lithium-prime/reef-alter
 reef
 ```
 
@@ -101,7 +101,7 @@ Reef 在任何目录都能启动。不在 git 仓库里时，Git 和 Graph 标�
 | `Space p` | 模糊路径快速打开文件 |
 | `Space f` | 全局内容搜索浮层 |
 | `Ctrl+O` | hosts 选择器（打开 SSH 连接） |
-| `v` | 关/开鼠标捕获（让终端原生选择文本） |
+| `Alt+V` | 关/开鼠标捕获（让终端原生选择文本） |
 | `↑` / `↓`、`j` / `k`、`Ctrl+P` / `Ctrl+N` | 导航 |
 | `Ctrl+K` / `Ctrl+J` | 导航（备用） |
 | `PgUp` / `PgDn` | 翻页 |
@@ -151,7 +151,7 @@ Reef 在任何目录都能启动。不在 git 仓库里时，Git 和 Graph 标�
 | 按键 | 功能 |
 | --- | --- |
 | `↑` / `↓`、`j` / `k` | 移动选中的 commit |
-| `V` | 进入 visual 模式（选一段 commit 区间） |
+| `Ctrl+Alt+V` | 进入 visual 模式（选一段 commit 区间） |
 | `↑` / `↓` 或 `PgUp` / `PgDn`（visual 中） | 扩展区间 |
 | `Shift+↑` / `Shift+↓`、`Shift+Click` | 不进 visual 模式直接扩选 |
 | 在 visual 中点击 | 设区间另一端 |

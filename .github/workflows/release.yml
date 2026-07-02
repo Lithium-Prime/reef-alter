@@ -111,7 +111,7 @@ jobs:
           retention-days: 7
 
   publish-platform-packages:
-    name: Publish @reef-tui/cli-${{ matrix.platform }}
+    name: Publish @lithium-prime/reef-alter-${{ matrix.platform }}
     needs: build
     runs-on: ubuntu-latest
     strategy:
@@ -161,7 +161,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   publish-main-package:
-    name: Publish @reef-tui/cli
+    name: Publish @lithium-prime/reef-alter
     needs: publish-platform-packages
     runs-on: ubuntu-latest
     steps:

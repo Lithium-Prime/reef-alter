@@ -120,11 +120,9 @@ fn space_does_not_arm_while_typing_in_commit_box() {
 }
 
 #[test]
-fn space_arms_when_commit_box_empty() {
-    // Empty buffer is the arming-friendly edge case: there's no char
-    // to clobber, and a chord that immediately fires is just as
-    // useful here as anywhere else. Mirrors the global-search query
-    // gate's `query.is_empty()` branch.
+fn bare_space_in_empty_commit_box_inserts_literal_space() {
+    // The commit box owns keys while editing, even with an empty buffer.
+    // Space must be text, not the global leader chord.
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDir::new().unwrap();
     let _g = CwdGuard::enter(tmp.path());
@@ -137,9 +135,38 @@ fn space_arms_when_commit_box_empty() {
 
     input::handle_key(space_key(), &mut app);
     assert!(
-        app.space_leader_at.is_some(),
-        "Space with empty commit buffer should still arm",
+        app.space_leader_at.is_none(),
+        "Space inside an empty commit message must not arm the chord",
     );
+    assert_eq!(app.git_status.commit_message, " ");
+}
+
+#[test]
+fn commit_box_swallows_global_shortcuts_while_editing() {
+    let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _g = CwdGuard::enter(tmp.path());
+
+    let mut app = App::new(Theme::dark(), None);
+    app.set_active_tab(Tab::Git);
+    app.active_panel = Panel::Files;
+    app.git_status.commit_editing = true;
+    app.git_status.commit_message = "fix".to_string();
+    app.git_status.commit_cursor = app.git_status.commit_message.len();
+    let sidebar_visible = app.sidebar_visible;
+
+    input::handle_key(
+        KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+        &mut app,
+    );
+    input::handle_key(
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        &mut app,
+    );
+
+    assert_eq!(app.sidebar_visible, sidebar_visible);
+    assert!(!app.hosts_picker.active);
+    assert_eq!(app.git_status.commit_message, "fix");
 }
 
 #[test]

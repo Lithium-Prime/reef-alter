@@ -333,6 +333,7 @@ pub(crate) fn resolve_target(app: &App) -> Option<SearchTarget> {
         // Files-tab preview.
         (Tab::Search, Panel::Files) => None,
         (Tab::Search, Panel::Diff) => Some(SearchTarget::FilePreview),
+        (Tab::Containers, Panel::Files | Panel::Diff) => None,
     }
 }
 

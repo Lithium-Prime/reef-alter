@@ -21,11 +21,12 @@ use std::thread;
 
 use reef::backend::{Backend, LocalBackend};
 use reef_proto::{
-    CommitDetailDto, CommitInfoDto, ContentSearchCompletedDto, DiffContentDto, DiffHunkDto,
-    DiffLineDto, DirEntryDto, Envelope, ErrorCode, FileEntryDto, FileStatusDto, Frame,
-    HandshakeResponse, LineTagDto, MatchHitDto, Notification, PROTOCOL_VERSION, ReadFileResponse,
-    RefLabelDto, RepoDiscoverResponseDto, Request, Response, StatusSnapshotDto, TrashResponseDto,
-    WalkResponseDto, WorkspaceRepoMetaDto, encode_frame, read_envelope,
+    CommitDetailDto, CommitInfoDto, ContainerActionDto, ContainerInfoDto, ContainerStateDto,
+    ContentSearchCompletedDto, DiffContentDto, DiffHunkDto, DiffLineDto, DirEntryDto, Envelope,
+    ErrorCode, FileEntryDto, FileStatusDto, Frame, HandshakeResponse, LineTagDto, MatchHitDto,
+    Notification, PROTOCOL_VERSION, ReadFileResponse, RefLabelDto, RepoDiscoverResponseDto,
+    Request, Response, StatusSnapshotDto, TrashResponseDto, WalkResponseDto,
+    WorkspaceRepoMetaDto, encode_frame, read_envelope,
 };
 
 struct Args {
@@ -255,6 +256,24 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             }
         }
 
+        Request::ListContainers => match backend.list_containers() {
+            Ok(containers) => serde_json::to_value(
+                containers
+                    .into_iter()
+                    .map(container_info_to_dto)
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+            Err(e) => Err(backend_err(e)),
+        },
+
+        Request::ContainerAction { id, action } => {
+            match backend.container_action(&id, container_action_from_dto(action)) {
+                Ok(()) => Ok(serde_json::json!({"ok": true})),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
+
         Request::GitStatus => match backend.git_status() {
             Ok(snap) => serde_json::to_value(StatusSnapshotDto {
                 staged: snap.staged.into_iter().map(file_entry_to_dto).collect(),
@@ -377,6 +396,16 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             Ok(()) => Ok(serde_json::json!({"ok": true})),
             Err(e) => Err(backend_err(e)),
         },
+        Request::PublishBranch => match backend.publish_branch() {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::PublishBranchFor { repo_root_rel } => {
+            match backend.publish_branch_for(&PathBuf::from(repo_root_rel)) {
+                Ok(()) => Ok(serde_json::json!({"ok": true})),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
         Request::Pull => match backend.pull() {
             Ok(()) => Ok(serde_json::json!({"ok": true})),
             Err(e) => Err(backend_err(e)),
@@ -395,6 +424,148 @@ fn dispatch(backend: &dyn Backend, workdir: &Path, env: Envelope) -> Option<Resp
             repo_root_rel,
             branch,
         } => match backend.checkout_branch_for(&PathBuf::from(repo_root_rel), &branch) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::CreateBranch { branch, base } => {
+            match backend.create_branch(&branch, base.as_deref()) {
+                Ok(()) => Ok(serde_json::json!({"ok": true})),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
+        Request::CreateBranchFor {
+            repo_root_rel,
+            branch,
+            base,
+        } => {
+            match backend.create_branch_for(&PathBuf::from(repo_root_rel), &branch, base.as_deref())
+            {
+                Ok(()) => Ok(serde_json::json!({"ok": true})),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
+        Request::MergeBranch { branch } => match backend.merge_branch(&branch) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::MergeBranchFor {
+            repo_root_rel,
+            branch,
+        } => match backend.merge_branch_for(&PathBuf::from(repo_root_rel), &branch) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::ListStashes => match backend.list_stashes() {
+            Ok(entries) => serde_json::to_value(
+                entries
+                    .into_iter()
+                    .map(reef_proto::StashEntryDto::from)
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::ListStashesFor { repo_root_rel } => {
+            match backend.list_stashes_for(&PathBuf::from(repo_root_rel)) {
+                Ok(entries) => serde_json::to_value(
+                    entries
+                        .into_iter()
+                        .map(reef_proto::StashEntryDto::from)
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
+        Request::StashDetail { stash_ref } => match backend.stash_detail(&stash_ref) {
+            Ok(detail) => serde_json::to_value(reef_proto::StashDetailDto::from(detail))
+                .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::StashDetailFor {
+            repo_root_rel,
+            stash_ref,
+        } => match backend.stash_detail_for(&PathBuf::from(repo_root_rel), &stash_ref) {
+            Ok(detail) => serde_json::to_value(reef_proto::StashDetailDto::from(detail))
+                .map_err(|e| (ErrorCode::Protocol, format!("encode: {e}"))),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::StashPush { options } => {
+            let options: reef::git::StashPushOptions = options.into();
+            match backend.stash_push(&options) {
+                Ok(()) => Ok(serde_json::json!({"ok": true})),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
+        Request::StashPushFor {
+            repo_root_rel,
+            options,
+        } => {
+            let options: reef::git::StashPushOptions = options.into();
+            match backend.stash_push_for(&PathBuf::from(repo_root_rel), &options) {
+                Ok(()) => Ok(serde_json::json!({"ok": true})),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
+        Request::StashApply {
+            stash_ref,
+            reinstate_index,
+        } => match backend.stash_apply(&stash_ref, reinstate_index) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::StashApplyFor {
+            repo_root_rel,
+            stash_ref,
+            reinstate_index,
+        } => match backend.stash_apply_for(
+            &PathBuf::from(repo_root_rel),
+            &stash_ref,
+            reinstate_index,
+        ) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::StashPop {
+            stash_ref,
+            reinstate_index,
+        } => match backend.stash_pop(&stash_ref, reinstate_index) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::StashPopFor {
+            repo_root_rel,
+            stash_ref,
+            reinstate_index,
+        } => {
+            match backend.stash_pop_for(&PathBuf::from(repo_root_rel), &stash_ref, reinstate_index)
+            {
+                Ok(()) => Ok(serde_json::json!({"ok": true})),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
+        Request::StashDrop { stash_ref } => match backend.stash_drop(&stash_ref) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::StashDropFor {
+            repo_root_rel,
+            stash_ref,
+        } => match backend.stash_drop_for(&PathBuf::from(repo_root_rel), &stash_ref) {
+            Ok(()) => Ok(serde_json::json!({"ok": true})),
+            Err(e) => Err(backend_err(e)),
+        },
+        Request::StashBranch { stash_ref, branch } => {
+            match backend.stash_branch(&stash_ref, &branch) {
+                Ok(()) => Ok(serde_json::json!({"ok": true})),
+                Err(e) => Err(backend_err(e)),
+            }
+        }
+        Request::StashBranchFor {
+            repo_root_rel,
+            stash_ref,
+            branch,
+        } => match backend.stash_branch_for(&PathBuf::from(repo_root_rel), &stash_ref, &branch) {
             Ok(()) => Ok(serde_json::json!({"ok": true})),
             Err(e) => Err(backend_err(e)),
         },
@@ -874,6 +1045,39 @@ fn file_entry_to_dto(e: reef::git::FileEntry) -> FileEntryDto {
         status: file_status_to_dto(e.status),
         additions: e.additions,
         deletions: e.deletions,
+    }
+}
+
+fn container_info_to_dto(c: reef::backend::ContainerInfo) -> ContainerInfoDto {
+    ContainerInfoDto {
+        id: c.id,
+        image: c.image,
+        command: c.command,
+        created: c.created,
+        status: c.status,
+        names: c.names,
+        ports: c.ports,
+        state: container_state_to_dto(c.state),
+    }
+}
+
+fn container_state_to_dto(s: reef::backend::ContainerState) -> ContainerStateDto {
+    match s {
+        reef::backend::ContainerState::Running => ContainerStateDto::Running,
+        reef::backend::ContainerState::Exited => ContainerStateDto::Exited,
+        reef::backend::ContainerState::Paused => ContainerStateDto::Paused,
+        reef::backend::ContainerState::Restarting => ContainerStateDto::Restarting,
+        reef::backend::ContainerState::Created => ContainerStateDto::Created,
+        reef::backend::ContainerState::Dead => ContainerStateDto::Dead,
+        reef::backend::ContainerState::Other => ContainerStateDto::Other,
+    }
+}
+
+fn container_action_from_dto(a: ContainerActionDto) -> reef::backend::ContainerAction {
+    match a {
+        ContainerActionDto::Start => reef::backend::ContainerAction::Start,
+        ContainerActionDto::Stop => reef::backend::ContainerAction::Stop,
+        ContainerActionDto::Restart => reef::backend::ContainerAction::Restart,
     }
 }
 

@@ -3,8 +3,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use reef::app::{App, Tab};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use reef::app::{App, BranchCreateStep, GitKeyboardFocus, Panel, SelectedFile, Tab};
 use reef::backend::{Backend, LocalBackend, repo_key};
+use reef::input;
 use reef::ui::git_status_panel;
 use reef::ui::theme::Theme;
 use tempfile::TempDir;
@@ -72,6 +74,12 @@ fn configure_upstream(path: &Path, remote_path: &Path) {
             &format!("branch.{branch}.merge"),
             &format!("refs/heads/{branch}"),
         )
+        .unwrap();
+}
+
+fn configure_origin(path: &Path, remote_path: &Path) {
+    let repo = git2::Repository::open(path).unwrap();
+    repo.remote("origin", remote_path.to_str().unwrap())
         .unwrap();
 }
 
@@ -152,6 +160,27 @@ fn wait_for_pull(app: &mut App) {
         thread::sleep(Duration::from_millis(10));
     }
     panic!("timed out waiting for pull");
+}
+
+fn wait_for_push(app: &mut App) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        app.tick();
+        if app.push_in_flight {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(app.push_in_flight, "timed out waiting for push to start");
+
+    while Instant::now() < deadline {
+        app.tick();
+        if !app.push_in_flight {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for push");
 }
 
 fn wait_for_diff(app: &mut App) {
@@ -248,6 +277,41 @@ fn app_auto_selects_root_repo() {
 }
 
 #[test]
+fn app_discovers_nested_repos_inside_root_repo() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_repo(tmp.path());
+    init_repo(&tmp.path().join("tools/child"));
+
+    let mut app = app_for(tmp.path());
+    wait_for_repo_catalog(&mut app);
+
+    assert_eq!(catalog_paths(&app), vec![".", "tools/child"]);
+    assert_eq!(app.repo_catalog.selected_git_repo, None);
+}
+
+#[test]
+fn git_file_edit_path_resolves_inside_selected_child_repo() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_repo(&tmp.path().join("alpha"));
+
+    let mut app = app_for(tmp.path());
+    wait_for_repo_catalog(&mut app);
+    app.select_file("src/lib.rs", false);
+    app.git_status.keyboard_focus = GitKeyboardFocus::Files;
+
+    app.activate_git_keyboard_focus();
+
+    assert_eq!(
+        app.pending_edit.as_deref(),
+        Some(tmp.path().join("alpha/src/lib.rs").as_path())
+    );
+}
+
+#[test]
 fn git_status_command_selects_discovered_repo() {
     let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDir::new().unwrap();
@@ -264,6 +328,31 @@ fn git_status_command_selects_discovered_repo() {
         "git.selectRepo",
         &serde_json::json!({ "repo": "beta" }),
     ));
+    assert_eq!(
+        app.repo_catalog.selected_git_repo.as_deref(),
+        Some(Path::new("beta"))
+    );
+}
+
+#[test]
+fn git_keyboard_selects_repository() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_repo(&tmp.path().join("alpha"));
+    init_repo(&tmp.path().join("beta"));
+
+    let mut app = app_for(tmp.path());
+    app.set_active_tab(Tab::Git);
+    wait_for_repo_catalog(&mut app);
+
+    assert_eq!(app.repo_catalog.selected_git_repo, None);
+    input::handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+    assert_eq!(app.git_status.keyboard_focus, GitKeyboardFocus::Repository);
+    assert_eq!(app.git_status.repo_selector_idx, 1);
+
+    input::handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+
     assert_eq!(
         app.repo_catalog.selected_git_repo.as_deref(),
         Some(Path::new("beta"))
@@ -365,6 +454,7 @@ fn app_discards_selected_child_repo_file() {
         "git.discardPrompt",
         &serde_json::json!({ "path": "same.txt" }),
     ));
+    wait_for_diff(&mut app);
     assert!(git_status_panel::handle_command(
         &mut app,
         "git.discardConfirm",
@@ -496,6 +586,76 @@ fn app_switches_branch_for_selected_child_repo() {
 }
 
 #[test]
+fn app_creates_branch_for_selected_child_repo() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_repo(&tmp.path().join("only"));
+    write_file(&tmp.path().join("only/a.txt"), "alpha\n");
+    commit_all(&tmp.path().join("only"), "base commit");
+    create_branch(&tmp.path().join("only"), "base-feature");
+
+    let mut app = app_for(tmp.path());
+    wait_for_repo_catalog(&mut app);
+    wait_for_git_status(&mut app);
+
+    app.open_branch_create_dialog();
+    app.start_branch_create_choose_base();
+    let base_idx = app
+        .branch_create_base_choices()
+        .iter()
+        .position(|branch| branch == "base-feature")
+        .unwrap();
+    app.select_branch_create_base(base_idx);
+    let dialog = app.git_status.branch_create_dialog.as_mut().unwrap();
+    dialog.input = "new-child".to_string();
+    dialog.cursor = dialog.input.len();
+    app.submit_branch_create_dialog();
+    wait_for_git_status(&mut app);
+
+    assert_eq!(app.branch_name, "new-child");
+    assert!(app.git_status.branch_create_dialog.is_none());
+}
+
+#[test]
+fn branch_create_mode_picker_moves_selection() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_repo(&tmp.path().join("only"));
+    write_file(&tmp.path().join("only/a.txt"), "alpha\n");
+    commit_all(&tmp.path().join("only"), "base commit");
+
+    let mut app = app_for(tmp.path());
+    wait_for_repo_catalog(&mut app);
+    wait_for_git_status(&mut app);
+    app.open_branch_create_dialog();
+
+    assert_eq!(
+        app.git_status
+            .branch_create_dialog
+            .as_ref()
+            .unwrap()
+            .selected_base_idx,
+        0
+    );
+    input::handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+    assert_eq!(
+        app.git_status
+            .branch_create_dialog
+            .as_ref()
+            .unwrap()
+            .selected_base_idx,
+        1
+    );
+    input::handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+    assert!(matches!(
+        app.git_status.branch_create_dialog.as_ref().unwrap().step,
+        BranchCreateStep::ChooseBase
+    ));
+}
+
+#[test]
 fn app_pulls_selected_child_repo() {
     let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let tmp = TempDir::new().unwrap();
@@ -530,5 +690,323 @@ fn app_pulls_selected_child_repo() {
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("only/remote.txt")).unwrap(),
         "remote\n"
+    );
+}
+
+#[test]
+fn app_publishes_selected_child_branch() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_bare_repo(&tmp.path().join("remote.git"));
+    init_repo(&tmp.path().join("only"));
+    configure_identity(&tmp.path().join("only"));
+    write_file(&tmp.path().join("only/base.txt"), "base\n");
+    commit_all(&tmp.path().join("only"), "base commit");
+    configure_origin(&tmp.path().join("only"), &tmp.path().join("remote.git"));
+
+    let mut app = app_for(tmp.path());
+    app.set_active_tab(Tab::Git);
+    wait_for_repo_catalog(&mut app);
+    wait_for_git_status(&mut app);
+    assert!(app.should_offer_publish_branch());
+    assert!(git_status_panel::handle_command(
+        &mut app,
+        "git.publishBranch",
+        &serde_json::json!({})
+    ));
+    wait_for_push(&mut app);
+
+    let repo = git2::Repository::open(tmp.path().join("only")).unwrap();
+    let branch = repo.head().unwrap().shorthand().unwrap().to_string();
+    assert_eq!(
+        repo.config()
+            .unwrap()
+            .get_string(&format!("branch.{branch}.remote"))
+            .unwrap(),
+        "origin"
+    );
+    assert!(
+        git2::Repository::open_bare(tmp.path().join("remote.git"))
+            .unwrap()
+            .find_reference(&format!("refs/heads/{branch}"))
+            .is_ok()
+    );
+}
+
+#[test]
+fn git_tab_entry_restores_arrow_navigation_to_change_list() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_repo(&tmp.path().join("only"));
+    configure_identity(&tmp.path().join("only"));
+    write_file(&tmp.path().join("only/a.txt"), "a1\n");
+    write_file(&tmp.path().join("only/b.txt"), "b1\n");
+    commit_all(&tmp.path().join("only"), "base commit");
+    write_file(&tmp.path().join("only/a.txt"), "a2\n");
+    write_file(&tmp.path().join("only/b.txt"), "b2\n");
+
+    let mut app = app_for(tmp.path());
+    wait_for_repo_catalog(&mut app);
+    app.active_panel = Panel::Diff;
+    app.set_active_tab(Tab::Git);
+    wait_for_git_status(&mut app);
+    app.selected_file = Some(SelectedFile {
+        path: "a.txt".to_string(),
+        is_staged: false,
+    });
+
+    input::handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+
+    assert_eq!(app.active_panel, Panel::Files);
+    assert_eq!(
+        app.selected_file.as_ref().map(|sel| sel.path.as_str()),
+        Some("b.txt")
+    );
+}
+
+#[test]
+fn git_keyboard_shortcut_ctrl_alt_m_focuses_commit_message() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_repo(&tmp.path().join("only"));
+    configure_identity(&tmp.path().join("only"));
+    write_file(&tmp.path().join("only/a.txt"), "a1\n");
+    commit_all(&tmp.path().join("only"), "base commit");
+
+    let mut app = app_for(tmp.path());
+    wait_for_repo_catalog(&mut app);
+    app.set_active_tab(Tab::Git);
+    wait_for_git_status(&mut app);
+    app.active_panel = Panel::Diff;
+
+    input::handle_key(
+        KeyEvent::new(
+            KeyCode::Char('m'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+        &mut app,
+    );
+    input::handle_key(
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        &mut app,
+    );
+
+    assert_eq!(app.active_panel, Panel::Files);
+    assert_eq!(
+        app.git_status.keyboard_focus,
+        GitKeyboardFocus::CommitMessage
+    );
+    assert!(app.git_status.commit_editing);
+    assert_eq!(app.git_status.commit_message, "x");
+}
+
+#[test]
+fn git_keyboard_focus_reaches_branch_and_commit_actions() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_repo(&tmp.path().join("only"));
+    configure_identity(&tmp.path().join("only"));
+    write_file(&tmp.path().join("only/a.txt"), "a1\n");
+    write_file(&tmp.path().join("only/b.txt"), "b1\n");
+    commit_all(&tmp.path().join("only"), "base commit");
+    create_branch(&tmp.path().join("only"), "feature");
+    write_file(&tmp.path().join("only/a.txt"), "a2\n");
+    write_file(&tmp.path().join("only/b.txt"), "b2\n");
+
+    let mut app = app_for(tmp.path());
+    app.set_active_tab(Tab::Git);
+    wait_for_repo_catalog(&mut app);
+    wait_for_git_status(&mut app);
+    app.selected_file = Some(SelectedFile {
+        path: "a.txt".to_string(),
+        is_staged: false,
+    });
+
+    input::handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut app);
+    assert_eq!(app.git_status.keyboard_focus, GitKeyboardFocus::StashHeader);
+
+    input::handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut app);
+    assert_eq!(app.git_status.keyboard_focus, GitKeyboardFocus::StashButton);
+
+    input::handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &mut app);
+    assert_eq!(
+        app.git_status.keyboard_focus,
+        GitKeyboardFocus::PublishBranchButton
+    );
+
+    input::handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &mut app);
+    assert_eq!(
+        app.git_status.keyboard_focus,
+        GitKeyboardFocus::CommitButton
+    );
+
+    input::handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut app);
+    assert_eq!(
+        app.git_status.keyboard_focus,
+        GitKeyboardFocus::CommitMessage
+    );
+
+    input::handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut app);
+    assert_eq!(app.git_status.keyboard_focus, GitKeyboardFocus::Branch);
+
+    input::handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+    assert!(app.git_status.branch_dropdown_open);
+    input::handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+    assert_eq!(app.git_status.branch_dropdown_idx, 1);
+    input::handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+
+    wait_for_git_status(&mut app);
+    assert_eq!(
+        git2::Repository::open(tmp.path().join("only"))
+            .unwrap()
+            .head()
+            .unwrap()
+            .shorthand(),
+        Some("feature")
+    );
+}
+
+#[test]
+fn app_stashes_and_applies_selected_repo_changes() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_repo(&tmp.path().join("only"));
+    configure_identity(&tmp.path().join("only"));
+    write_file(&tmp.path().join("only/a.txt"), "base\n");
+    commit_all(&tmp.path().join("only"), "base commit");
+    write_file(&tmp.path().join("only/a.txt"), "changed\n");
+
+    let mut app = app_for(tmp.path());
+    app.set_active_tab(Tab::Git);
+    wait_for_repo_catalog(&mut app);
+    wait_for_git_status(&mut app);
+
+    input::handle_key(
+        KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ),
+        &mut app,
+    );
+    wait_for_git_status(&mut app);
+
+    assert!(app.git_status.pending_stash_action.is_some());
+    assert_eq!(app.git_status.stashes.len(), 0);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("only/a.txt")).unwrap(),
+        "changed\n"
+    );
+
+    input::handle_key(
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        &mut app,
+    );
+    wait_for_git_status(&mut app);
+
+    assert_eq!(app.git_status.stashes.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("only/a.txt")).unwrap(),
+        "base\n"
+    );
+
+    app.git_status.keyboard_focus = GitKeyboardFocus::Files;
+    input::handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut app);
+    assert_eq!(app.git_status.keyboard_focus, GitKeyboardFocus::StashHeader);
+    input::handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+    assert!(app.git_status.stash_section_open);
+    input::handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+    assert_eq!(
+        app.git_status.keyboard_focus,
+        GitKeyboardFocus::StashAllButton
+    );
+    input::handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+    assert_eq!(app.git_status.keyboard_focus, GitKeyboardFocus::Stashes);
+    input::handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+    wait_for_git_status(&mut app);
+
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("only/a.txt")).unwrap(),
+        "changed\n"
+    );
+}
+
+#[test]
+fn git_keyboard_selects_stash_modes() {
+    let _lock = APP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    let _home = HomeGuard::enter(tmp.path());
+    init_repo(&tmp.path().join("only"));
+    configure_identity(&tmp.path().join("only"));
+    write_file(&tmp.path().join("only/a.txt"), "a base\n");
+    write_file(&tmp.path().join("only/b.txt"), "b base\n");
+    commit_all(&tmp.path().join("only"), "base commit");
+    write_file(&tmp.path().join("only/a.txt"), "a changed\n");
+    write_file(&tmp.path().join("only/b.txt"), "b changed\n");
+
+    let mut app = app_for(tmp.path());
+    app.set_active_tab(Tab::Git);
+    wait_for_repo_catalog(&mut app);
+    wait_for_git_status(&mut app);
+    app.selected_file = Some(SelectedFile {
+        path: "a.txt".to_string(),
+        is_staged: false,
+    });
+    app.git_status.keyboard_focus = GitKeyboardFocus::Files;
+
+    input::handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut app);
+    assert_eq!(app.git_status.keyboard_focus, GitKeyboardFocus::StashHeader);
+    input::handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+    assert!(app.git_status.stash_section_open);
+    input::handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+    assert_eq!(
+        app.git_status.keyboard_focus,
+        GitKeyboardFocus::StashAllButton
+    );
+    for _ in 0..4 {
+        input::handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut app);
+    }
+    assert_eq!(
+        app.git_status.keyboard_focus,
+        GitKeyboardFocus::StashSelectedButton
+    );
+    input::handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &mut app);
+    assert_eq!(
+        app.git_status.keyboard_focus,
+        GitKeyboardFocus::StashStagedButton
+    );
+    input::handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &mut app);
+    assert_eq!(
+        app.git_status.keyboard_focus,
+        GitKeyboardFocus::StashSelectedButton
+    );
+    input::handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+    wait_for_git_status(&mut app);
+
+    assert!(app.git_status.pending_stash_action.is_some());
+    assert_eq!(app.git_status.stashes.len(), 0);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("only/a.txt")).unwrap(),
+        "a changed\n"
+    );
+
+    input::handle_key(
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        &mut app,
+    );
+    wait_for_git_status(&mut app);
+
+    assert_eq!(app.git_status.stashes.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("only/a.txt")).unwrap(),
+        "a base\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("only/b.txt")).unwrap(),
+        "b changed\n"
     );
 }

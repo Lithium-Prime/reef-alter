@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use reef::backend::{
     Backend, LocalBackend, RemoteBackend, RepoDiscoverOpts, normalize_repo_root_rel, repo_key,
 };
+use reef::git::{FileStatus, StashPushOptions};
 use tempfile::TempDir;
 use test_support::agent_bin;
 
@@ -52,6 +53,12 @@ fn configure_upstream(path: &Path, remote_path: &Path) -> String {
         )
         .unwrap();
     branch
+}
+
+fn configure_origin(path: &Path, remote_path: &Path) {
+    let repo = git2::Repository::open(path).unwrap();
+    repo.remote("origin", remote_path.to_str().unwrap())
+        .unwrap();
 }
 
 fn create_branch(path: &Path, branch: &str) {
@@ -119,6 +126,33 @@ fn commit_all(path: &Path, message: &str) {
     let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
     repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
         .unwrap();
+}
+
+fn git_ok(path: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .current_dir(path)
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed");
+}
+
+fn git_output(path: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .current_dir(path)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?} failed");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn stage_file(path: &Path, file: &str) {
+    git_ok(path, &["add", file]);
+}
+
+fn reset_hard(path: &Path) {
+    git_ok(path, &["reset", "--hard", "HEAD"]);
 }
 
 fn repo_paths(backend: &dyn Backend, opts: &RepoDiscoverOpts) -> (Vec<String>, bool) {
@@ -191,28 +225,33 @@ fn max_depth_limits_discovery() {
 }
 
 #[test]
-fn nested_repos_are_suppressed_by_default() {
+fn nested_repos_are_discovered_by_default() {
     let tmp = TempDir::new().unwrap();
     init_repo(&tmp.path().join("outer"));
     init_repo(&tmp.path().join("outer/inner"));
 
     let backend = LocalBackend::open_at(tmp.path().to_path_buf());
-    let default_nested = RepoDiscoverOpts {
-        max_depth: 2,
-        include_nested: false,
-        max_repos: Some(100),
-    };
+    let default_nested = RepoDiscoverOpts::default();
     let include_nested = RepoDiscoverOpts {
         max_depth: 2,
         include_nested: true,
         max_repos: Some(100),
     };
+    let suppress_nested = RepoDiscoverOpts {
+        max_depth: 2,
+        include_nested: false,
+        max_repos: Some(100),
+    };
 
-    assert_eq!(repo_paths(&backend, &default_nested).0, vec!["outer"]);
+    assert_eq!(
+        repo_paths(&backend, &default_nested).0,
+        vec!["outer", "outer/inner"]
+    );
     assert_eq!(
         repo_paths(&backend, &include_nested).0,
         vec!["outer", "outer/inner"]
     );
+    assert_eq!(repo_paths(&backend, &suppress_nested).0, vec!["outer"]);
 }
 
 #[test]
@@ -571,4 +610,471 @@ fn checkout_branch_for_child_repo_remote_matches_local() {
             .branch_name,
         "feature"
     );
+}
+
+#[test]
+fn create_branch_for_child_repo_remote_matches_local() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    init_repo(&tmp.path().join("alpha"));
+    write_file(&tmp.path().join("alpha/a.txt"), "alpha\n");
+    commit_all(&tmp.path().join("alpha"), "alpha commit");
+    create_branch(&tmp.path().join("alpha"), "base-feature");
+
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    local
+        .create_branch_for(Path::new("alpha"), "local-new", None)
+        .unwrap();
+    assert_eq!(
+        local
+            .git_status_for(Path::new("alpha"))
+            .unwrap()
+            .branch_name,
+        "local-new"
+    );
+
+    local
+        .checkout_branch_for(Path::new("alpha"), "master")
+        .unwrap();
+    let remote = spawn_remote(tmp.path());
+    remote
+        .create_branch_for(Path::new("alpha"), "remote-new", Some("base-feature"))
+        .unwrap();
+    assert_eq!(
+        remote
+            .git_status_for(Path::new("alpha"))
+            .unwrap()
+            .branch_name,
+        "remote-new"
+    );
+    assert!(git2::Repository::open(tmp.path()).unwrap().head().is_err());
+}
+
+#[test]
+fn merge_branch_for_child_repo_remote_matches_local() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    for repo_name in ["alpha", "beta"] {
+        let repo_path = tmp.path().join(repo_name);
+        init_repo(&repo_path);
+        write_file(&repo_path.join("base.txt"), "base\n");
+        commit_all(&repo_path, "base");
+        create_branch(&repo_path, "feature");
+        git_ok(&repo_path, &["checkout", "feature"]);
+        write_file(&repo_path.join("feature.txt"), "feature\n");
+        commit_all(&repo_path, "feature");
+        git_ok(&repo_path, &["checkout", "master"]);
+    }
+
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    local
+        .merge_branch_for(Path::new("alpha"), "feature")
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("alpha/feature.txt")).unwrap(),
+        "feature\n"
+    );
+
+    let remote = spawn_remote(tmp.path());
+    remote
+        .merge_branch_for(Path::new("beta"), "feature")
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("beta/feature.txt")).unwrap(),
+        "feature\n"
+    );
+    assert!(git2::Repository::open(tmp.path()).unwrap().head().is_err());
+}
+
+#[test]
+fn publish_branch_for_child_repo_remote_matches_local() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    init_bare_repo(&tmp.path().join("remote.git"));
+    init_repo(&tmp.path().join("alpha"));
+    configure_identity(&tmp.path().join("alpha"));
+    write_file(&tmp.path().join("alpha/a.txt"), "alpha\n");
+    commit_all(&tmp.path().join("alpha"), "alpha commit");
+    configure_origin(&tmp.path().join("alpha"), &tmp.path().join("remote.git"));
+
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    local.publish_branch_for(Path::new("alpha")).unwrap();
+    let alpha = git2::Repository::open(tmp.path().join("alpha")).unwrap();
+    let branch = alpha.head().unwrap().shorthand().unwrap().to_string();
+    assert_eq!(
+        alpha
+            .config()
+            .unwrap()
+            .get_string(&format!("branch.{branch}.remote"))
+            .unwrap(),
+        "origin"
+    );
+    assert!(
+        git2::Repository::open_bare(tmp.path().join("remote.git"))
+            .unwrap()
+            .find_reference(&format!("refs/heads/{branch}"))
+            .is_ok()
+    );
+
+    local
+        .create_branch_for(Path::new("alpha"), "remote-new", None)
+        .unwrap();
+    let remote = spawn_remote(tmp.path());
+    remote.publish_branch_for(Path::new("alpha")).unwrap();
+    assert!(
+        git2::Repository::open_bare(tmp.path().join("remote.git"))
+            .unwrap()
+            .find_reference("refs/heads/remote-new")
+            .is_ok()
+    );
+    assert!(git2::Repository::open(tmp.path()).unwrap().head().is_err());
+}
+
+#[test]
+fn stash_for_child_repo_remote_matches_local() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    init_repo(&tmp.path().join("alpha"));
+    init_repo(&tmp.path().join("beta"));
+    configure_identity(&tmp.path().join("alpha"));
+    configure_identity(&tmp.path().join("beta"));
+    write_file(&tmp.path().join("alpha/a.txt"), "alpha base\n");
+    write_file(&tmp.path().join("beta/b.txt"), "beta base\n");
+    commit_all(&tmp.path().join("alpha"), "alpha base");
+    commit_all(&tmp.path().join("beta"), "beta base");
+
+    write_file(&tmp.path().join("alpha/a.txt"), "alpha local\n");
+    write_file(&tmp.path().join("beta/b.txt"), "beta local\n");
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    local
+        .stash_push_for(
+            Path::new("alpha"),
+            &reef::git::StashPushOptions {
+                message: "alpha stash".to_string(),
+                include_untracked: true,
+                keep_index: false,
+                staged_only: false,
+                paths: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert_eq!(local.list_stashes_for(Path::new("alpha")).unwrap().len(), 1);
+    assert_eq!(local.list_stashes_for(Path::new("beta")).unwrap().len(), 0);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("alpha/a.txt")).unwrap(),
+        "alpha base\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("beta/b.txt")).unwrap(),
+        "beta local\n"
+    );
+
+    let remote = spawn_remote(tmp.path());
+    remote
+        .stash_apply_for(Path::new("alpha"), "stash@{0}", false)
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("alpha/a.txt")).unwrap(),
+        "alpha local\n"
+    );
+    remote
+        .stash_drop_for(Path::new("alpha"), "stash@{0}")
+        .unwrap();
+    assert_eq!(
+        remote.list_stashes_for(Path::new("alpha")).unwrap().len(),
+        0
+    );
+}
+
+#[test]
+fn stash_push_options_cover_data_preserving_modes() {
+    let tmp = TempDir::new().unwrap();
+    let repo_path = tmp.path().join("only");
+    init_repo(&repo_path);
+    configure_identity(&repo_path);
+    write_file(&repo_path.join("a.txt"), "a base\n");
+    write_file(&repo_path.join("b.txt"), "b base\n");
+    commit_all(&repo_path, "base");
+
+    let backend = LocalBackend::open_at(tmp.path().to_path_buf());
+
+    write_file(&repo_path.join("a.txt"), "a tracked\n");
+    write_file(&repo_path.join("untracked.txt"), "new\n");
+    backend
+        .stash_push_for(
+            Path::new("only"),
+            &StashPushOptions {
+                message: "tracked only".to_string(),
+                include_untracked: false,
+                keep_index: false,
+                staged_only: false,
+                paths: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("a.txt")).unwrap(),
+        "a base\n"
+    );
+    assert!(repo_path.join("untracked.txt").exists());
+    let detail = backend
+        .stash_detail_for(Path::new("only"), "stash@{0}")
+        .unwrap();
+    assert!(!detail.entry.includes_untracked);
+    backend
+        .stash_drop_for(Path::new("only"), "stash@{0}")
+        .unwrap();
+    std::fs::remove_file(repo_path.join("untracked.txt")).unwrap();
+
+    write_file(&repo_path.join("a.txt"), "a tracked\n");
+    write_file(&repo_path.join("untracked.txt"), "new\n");
+    backend
+        .stash_push_for(
+            Path::new("only"),
+            &StashPushOptions {
+                message: "with untracked".to_string(),
+                include_untracked: true,
+                keep_index: false,
+                staged_only: false,
+                paths: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert!(!repo_path.join("untracked.txt").exists());
+    let detail = backend
+        .stash_detail_for(Path::new("only"), "stash@{0}")
+        .unwrap();
+    assert!(detail.entry.includes_untracked);
+    assert!(detail.files.iter().any(|f| f.path == "untracked.txt"));
+    backend
+        .stash_drop_for(Path::new("only"), "stash@{0}")
+        .unwrap();
+
+    write_file(&repo_path.join("added.txt"), "tracked add\n");
+    stage_file(&repo_path, "added.txt");
+    backend
+        .stash_push_for(
+            Path::new("only"),
+            &StashPushOptions {
+                message: "tracked add".to_string(),
+                include_untracked: false,
+                keep_index: false,
+                staged_only: false,
+                paths: Vec::new(),
+            },
+        )
+        .unwrap();
+    let detail = backend
+        .stash_detail_for(Path::new("only"), "stash@{0}")
+        .unwrap();
+    assert!(!detail.entry.includes_untracked);
+    assert!(detail.files.iter().any(|f| f.path == "added.txt"));
+    backend
+        .stash_drop_for(Path::new("only"), "stash@{0}")
+        .unwrap();
+
+    git_ok(&repo_path, &["mv", "b.txt", "renamed.txt"]);
+    backend
+        .stash_push_for(
+            Path::new("only"),
+            &StashPushOptions {
+                message: "renamed file".to_string(),
+                include_untracked: false,
+                keep_index: false,
+                staged_only: false,
+                paths: Vec::new(),
+            },
+        )
+        .unwrap();
+    let detail = backend
+        .stash_detail_for(Path::new("only"), "stash@{0}")
+        .unwrap();
+    assert!(
+        detail
+            .files
+            .iter()
+            .any(|f| f.path == "renamed.txt" && f.status == FileStatus::Renamed)
+    );
+    backend
+        .stash_drop_for(Path::new("only"), "stash@{0}")
+        .unwrap();
+    reset_hard(&repo_path);
+
+    write_file(&repo_path.join("a.txt"), "a staged\n");
+    stage_file(&repo_path, "a.txt");
+    write_file(&repo_path.join("b.txt"), "b unstaged\n");
+    backend
+        .stash_push_for(
+            Path::new("only"),
+            &StashPushOptions {
+                message: "keep index".to_string(),
+                include_untracked: false,
+                keep_index: true,
+                staged_only: false,
+                paths: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("a.txt")).unwrap(),
+        "a staged\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("b.txt")).unwrap(),
+        "b base\n"
+    );
+    assert_eq!(
+        git_output(&repo_path, &["diff", "--cached", "--name-only"]),
+        "a.txt\n"
+    );
+    backend
+        .stash_drop_for(Path::new("only"), "stash@{0}")
+        .unwrap();
+    reset_hard(&repo_path);
+
+    write_file(&repo_path.join("a.txt"), "a staged\n");
+    stage_file(&repo_path, "a.txt");
+    write_file(&repo_path.join("b.txt"), "b unstaged\n");
+    backend
+        .stash_push_for(
+            Path::new("only"),
+            &StashPushOptions {
+                message: "staged only".to_string(),
+                include_untracked: false,
+                keep_index: false,
+                staged_only: true,
+                paths: Vec::new(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("a.txt")).unwrap(),
+        "a base\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("b.txt")).unwrap(),
+        "b unstaged\n"
+    );
+    let detail = backend
+        .stash_detail_for(Path::new("only"), "stash@{0}")
+        .unwrap();
+    assert_eq!(detail.files.len(), 1);
+    assert_eq!(detail.files[0].path, "a.txt");
+    backend
+        .stash_drop_for(Path::new("only"), "stash@{0}")
+        .unwrap();
+    reset_hard(&repo_path);
+
+    write_file(&repo_path.join("a.txt"), "a selected\n");
+    write_file(&repo_path.join("b.txt"), "b not selected\n");
+    backend
+        .stash_push_for(
+            Path::new("only"),
+            &StashPushOptions {
+                message: "selected file".to_string(),
+                include_untracked: false,
+                keep_index: false,
+                staged_only: false,
+                paths: vec!["a.txt".to_string()],
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("a.txt")).unwrap(),
+        "a base\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("b.txt")).unwrap(),
+        "b not selected\n"
+    );
+    let detail = backend
+        .stash_detail_for(Path::new("only"), "stash@{0}")
+        .unwrap();
+    assert_eq!(detail.files.len(), 1);
+    assert_eq!(detail.files[0].path, "a.txt");
+}
+
+#[test]
+fn stash_detail_pop_and_branch_for_child_repo_remote_matches_local() {
+    let _lock = BACKEND_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = TempDir::new().unwrap();
+    init_repo(tmp.path());
+    init_repo(&tmp.path().join("alpha"));
+    configure_identity(&tmp.path().join("alpha"));
+    write_file(&tmp.path().join("alpha/a.txt"), "base\n");
+    commit_all(&tmp.path().join("alpha"), "base");
+
+    write_file(&tmp.path().join("alpha/a.txt"), "pop change\n");
+    let local = LocalBackend::open_at(tmp.path().to_path_buf());
+    local
+        .stash_push_for(
+            Path::new("alpha"),
+            &StashPushOptions {
+                message: "pop stash".to_string(),
+                include_untracked: false,
+                keep_index: false,
+                staged_only: false,
+                paths: Vec::new(),
+            },
+        )
+        .unwrap();
+
+    let remote = spawn_remote(tmp.path());
+    let detail = remote
+        .stash_detail_for(Path::new("alpha"), "stash@{0}")
+        .unwrap();
+    assert!(detail.entry.message.contains("pop stash"));
+    assert_eq!(detail.files.len(), 1);
+    assert_eq!(detail.files[0].path, "a.txt");
+    assert!(detail.patch.contains("pop change"));
+    remote
+        .stash_pop_for(Path::new("alpha"), "stash@{0}", false)
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("alpha/a.txt")).unwrap(),
+        "pop change\n"
+    );
+    assert_eq!(
+        remote.list_stashes_for(Path::new("alpha")).unwrap().len(),
+        0
+    );
+
+    reset_hard(&tmp.path().join("alpha"));
+    write_file(&tmp.path().join("alpha/a.txt"), "branch change\n");
+    remote
+        .stash_push_for(
+            Path::new("alpha"),
+            &StashPushOptions {
+                message: "branch stash".to_string(),
+                include_untracked: false,
+                keep_index: false,
+                staged_only: false,
+                paths: Vec::new(),
+            },
+        )
+        .unwrap();
+    remote
+        .stash_branch_for(Path::new("alpha"), "stash@{0}", "from-stash")
+        .unwrap();
+    assert_eq!(
+        git2::Repository::open(tmp.path().join("alpha"))
+            .unwrap()
+            .head()
+            .unwrap()
+            .shorthand(),
+        Some("from-stash")
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("alpha/a.txt")).unwrap(),
+        "branch change\n"
+    );
+    assert_eq!(
+        remote.list_stashes_for(Path::new("alpha")).unwrap().len(),
+        0
+    );
+    assert!(git2::Repository::open(tmp.path()).unwrap().head().is_err());
 }

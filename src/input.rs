@@ -2,13 +2,13 @@
 //! event-drain loop to `handle_key` and `handle_mouse` here, so the binary
 //! entry point stays focused on terminal bootstrap.
 //!
-//! The one exception is the `v` (select mode toggle) and `show_help`
+//! The one exception is the `Alt+V` (select mode toggle) and `show_help`
 //! dismiss — those stay inline in `main.rs` because the first needs
 //! `execute!(terminal.backend_mut(), ...)` to flip crossterm's mouse
 //! capture mode, and both are simple enough that splitting them out would
 //! just add indirection.
 
-use crate::app::{App, DbNav, Panel, Tab, ViewMode};
+use crate::app::{App, BranchCreateStep, DbNav, GitKeyboardFocus, Panel, Tab, ViewMode};
 use crate::clipboard;
 use crate::global_search;
 use crate::i18n::{Msg, t};
@@ -147,6 +147,11 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         return;
     }
 
+    if app.git_status.branch_create_dialog.is_some() {
+        handle_key_branch_create_dialog(key, app);
+        return;
+    }
+
     // Inline tree editor (New File / New Folder / Rename): while
     // `tree_edit.active`, every non-Ctrl-C keystroke goes into the
     // editable buffer. Priority-wise this sits above place-mode and
@@ -233,24 +238,32 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         return;
     }
 
-    // Space-leader chord: bare Space primes, bare `p` opens the quick-open
-    // palette, bare `f` opens the global-search palette. Bare Space has no
-    // other global meaning, so the chord doesn't collide with any existing
-    // binding. Context: we're already past the palette / search / place
-    // gates, so the leader is only in play during normal tab navigation.
-    //
-    // Exception: when a text input is focused — the Tab::Search query or
-    // the Tab::Git commit box — bare Space is a literal character the user
-    // is typing. We gate arming off so "foo bar" / "fix: the thing" just
-    // types. An empty buffer is fine to arm anyway — there's no char to
-    // accidentally swallow yet.
     let search_input_focused = app.active_tab == Tab::Search
         && app.active_panel == Panel::Files
         && app.global_search.input_focused();
     let commit_input_focused = app.active_tab == Tab::Git
         && app.active_panel == Panel::Files
         && app.git_status.commit_editing;
-    let in_input_mode = search_input_focused || commit_input_focused;
+
+    // The Git commit box owns the keyboard while editing. Known text-editing
+    // keys update the buffer; unknown Ctrl/Alt chords are swallowed here so
+    // they cannot leak into global or Git shortcuts.
+    if commit_input_focused {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        handle_key_git_commit(key, app, ctrl, alt);
+        return;
+    }
+
+    // Space-leader chord: bare Space primes, bare `p` opens the quick-open
+    // palette, bare `f` opens the global-search palette. Bare Space has no
+    // other global meaning, so the chord doesn't collide with any existing
+    // binding. Context: we're already past the palette / search / place
+    // gates, so the leader is only in play during normal tab navigation.
+    //
+    // Exception: when the Tab::Search query is focused, bare Space is a
+    // literal character the user is typing. Commit input returns above.
+    let in_input_mode = search_input_focused;
     // In Tab::Search list mode + replace_open, bare `Space` is the
     // per-match toggle — disarm the leader chord so a single tap of
     // Space doesn't ambiguously prime a chord and never resolve.
@@ -260,8 +273,6 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         && app.global_search.replace_open;
     let leader_allow_arm = if search_input_focused {
         app.global_search.query.is_empty()
-    } else if commit_input_focused {
-        app.git_status.commit_message.is_empty()
     } else {
         !search_list_replace_mode
     };
@@ -333,7 +344,10 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         // the always-on block so it works regardless of which tab or panel
         // owns focus; overlays (quick-open, global-search, hosts picker)
         // return earlier so they're unaffected.
-        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('b')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT) =>
+        {
             app.toggle_sidebar();
             return;
         }
@@ -494,6 +508,103 @@ pub fn handle_key(key: KeyEvent, app: &mut App) {
         Tab::Files => handle_key_files(key, app),
         Tab::Search => handle_key_search(key, app),
         Tab::Graph => handle_key_graph(key, app),
+        Tab::Containers => handle_key_containers(key, app),
+    }
+}
+
+fn handle_key_containers(key: KeyEvent, app: &mut App) {
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => app.move_container_selection(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.move_container_selection(1),
+        KeyCode::PageUp => app.move_container_selection(-10),
+        KeyCode::PageDown => app.move_container_selection(10),
+        KeyCode::Home => app.select_container(0),
+        KeyCode::End => {
+            let last = app.containers.containers.len().saturating_sub(1);
+            app.select_container(last);
+        }
+        KeyCode::Char('r') => {
+            app.containers_load.mark_stale();
+        }
+        KeyCode::Char('s') => app.run_container_action(crate::backend::ContainerAction::Start),
+        KeyCode::Char('x') => app.run_container_action(crate::backend::ContainerAction::Stop),
+        KeyCode::Char('R') => app.run_container_action(crate::backend::ContainerAction::Restart),
+        _ => {}
+    }
+}
+
+fn handle_key_branch_create_dialog(key: KeyEvent, app: &mut App) {
+    let Some(step) = app
+        .git_status
+        .branch_create_dialog
+        .as_ref()
+        .map(|dialog| dialog.step.clone())
+    else {
+        return;
+    };
+    match step {
+        BranchCreateStep::ChooseMode => match key.code {
+            KeyCode::Esc => app.cancel_branch_create_dialog(),
+            KeyCode::Up | KeyCode::Down => {
+                if let Some(dialog) = app.git_status.branch_create_dialog.as_mut() {
+                    dialog.selected_base_idx = if dialog.selected_base_idx == 0 { 1 } else { 0 };
+                }
+            }
+            KeyCode::Enter => {
+                let selected = app
+                    .git_status
+                    .branch_create_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.selected_base_idx)
+                    .unwrap_or(0);
+                if selected == 0 {
+                    app.start_branch_create_from_current();
+                } else {
+                    app.start_branch_create_choose_base();
+                }
+            }
+            _ => {}
+        },
+        BranchCreateStep::ChooseBase => match key.code {
+            KeyCode::Esc => app.cancel_branch_create_dialog(),
+            KeyCode::Up => {
+                if let Some(dialog) = app.git_status.branch_create_dialog.as_mut() {
+                    dialog.selected_base_idx = dialog.selected_base_idx.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                let max = app.branch_create_base_choices().len().saturating_sub(1);
+                if let Some(dialog) = app.git_status.branch_create_dialog.as_mut() {
+                    dialog.selected_base_idx = (dialog.selected_base_idx + 1).min(max);
+                }
+            }
+            KeyCode::Enter => {
+                let selected = app
+                    .git_status
+                    .branch_create_dialog
+                    .as_ref()
+                    .map(|dialog| dialog.selected_base_idx)
+                    .unwrap_or(0);
+                app.select_branch_create_base(selected);
+            }
+            _ => {}
+        },
+        BranchCreateStep::EnterName { .. } => match key.code {
+            KeyCode::Esc => app.cancel_branch_create_dialog(),
+            KeyCode::Enter => app.submit_branch_create_dialog(),
+            _ => {
+                if let Some(dialog) = app.git_status.branch_create_dialog.as_mut() {
+                    let outcome = crate::input_edit::dispatch_key(
+                        &key,
+                        &mut dialog.input,
+                        &mut dialog.cursor,
+                    );
+                    if matches!(outcome, crate::input_edit::Outcome::Edited) {
+                        dialog.error = None;
+                    }
+                }
+            }
+        },
     }
 }
 
@@ -1052,11 +1163,12 @@ fn graph_scroll_right_panel(app: &mut App, delta: i32) {
 fn handle_key_graph(key: KeyEvent, app: &mut App) {
     use ui::{commit_detail_panel, git_graph_panel};
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     // While in visual mode every direction key extends (no Shift needed —
     // works in terminals that intercept Shift+Click / Shift+Arrow for text
-    // selection), a mouse click on a commit moves the endpoint, and `V` /
-    // `Esc` exits. This is the primary path; Shift+Arrow below is kept as
+    // selection), a mouse click on a commit moves the endpoint, and
+    // Ctrl+Alt+V / Esc exits. This is the primary path; Shift+Arrow below is kept as
     // a convenience for terminals that *do* forward the modifier.
     let in_visual = app.git_graph.in_visual_mode() && app.active_panel == Panel::Files;
     match key.code {
@@ -1132,11 +1244,11 @@ fn handle_key_graph(key: KeyEvent, app: &mut App) {
                 graph_scroll_right_panel(app, 20);
             }
         }
-        // `V` (uppercase = Shift+v) toggles visual mode. Entering: anchor
+        // Ctrl+Alt+V toggles visual mode. Entering: anchor
         // collapses onto the cursor (is_range() stays false until the user
         // actually extends), so the status bar can distinguish "armed but
         // empty" from an active range if it wants to.
-        KeyCode::Char('V') if app.active_panel == Panel::Files => {
+        KeyCode::Char('v' | 'V') if app.active_panel == Panel::Files && ctrl && alt => {
             if app.git_graph.in_visual_mode() {
                 app.clear_graph_range();
             } else if !app.git_graph.rows.is_empty() {
@@ -1306,7 +1418,7 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
     }
     match key.code {
         KeyCode::Up | KeyCode::Char('k') if !ctrl => match app.active_panel {
-            Panel::Files => app.navigate_files(-1),
+            Panel::Files => app.move_git_keyboard_focus_vertical(-1),
             // Git tab has no middle column — Panel::Commit should never
             // be set here, but if it slips through treat it as Diff.
             Panel::Diff | Panel::Commit => {
@@ -1314,7 +1426,7 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
             }
         },
         KeyCode::Down | KeyCode::Char('j') if !ctrl => match app.active_panel {
-            Panel::Files => app.navigate_files(1),
+            Panel::Files => app.move_git_keyboard_focus_vertical(1),
             Panel::Diff | Panel::Commit => {
                 app.diff_scroll += 1;
             }
@@ -1326,13 +1438,13 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
         // own arms because they check `!ctrl` implicitly via being
         // matched only if the Ctrl arm above didn't fire.
         KeyCode::Char('p' | 'k') if ctrl => match app.active_panel {
-            Panel::Files => app.navigate_files(-1),
+            Panel::Files => app.move_git_keyboard_focus_vertical(-1),
             Panel::Diff | Panel::Commit => {
                 app.diff_scroll = app.diff_scroll.saturating_sub(1);
             }
         },
         KeyCode::Char('n' | 'j') if ctrl => match app.active_panel {
-            Panel::Files => app.navigate_files(1),
+            Panel::Files => app.move_git_keyboard_focus_vertical(1),
             Panel::Diff | Panel::Commit => {
                 app.diff_scroll += 1;
             }
@@ -1349,6 +1461,12 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
                 app.diff_scroll += 20;
             }
         },
+        KeyCode::Left if app.active_panel == Panel::Files => {
+            app.move_git_keyboard_focus_horizontal(-1);
+        }
+        KeyCode::Right if app.active_panel == Panel::Files => {
+            app.move_git_keyboard_focus_horizontal(1);
+        }
         KeyCode::Left if app.active_panel == Panel::Diff => {
             let step = if key.modifiers.contains(KeyModifiers::SHIFT) {
                 10
@@ -1383,6 +1501,44 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
             app.sbs_left_h_scroll = usize::MAX;
             app.sbs_right_h_scroll = usize::MAX;
         }
+        KeyCode::Char('m') if ctrl && alt => {
+            app.active_panel = Panel::Files;
+            app.git_status.keyboard_focus = GitKeyboardFocus::CommitMessage;
+            app.git_status.commit_editing = true;
+        }
+        KeyCode::Char('b') if ctrl && alt => {
+            if app.git_branch_selector_visible() {
+                app.active_panel = Panel::Files;
+                app.git_status.keyboard_focus = GitKeyboardFocus::Branch;
+                app.activate_git_keyboard_focus();
+            }
+        }
+        KeyCode::Char('s') if ctrl && alt => {
+            ui::git_status_panel::handle_command(app, "git.stashPush", &serde_json::json!({}));
+        }
+        KeyCode::Char('a') if ctrl && alt => {
+            ui::git_status_panel::handle_command(app, "git.stashApply", &serde_json::json!({}));
+        }
+        KeyCode::Char('p') if ctrl && alt => {
+            ui::git_status_panel::handle_command(app, "git.stashPop", &serde_json::json!({}));
+        }
+        KeyCode::Char('d') if ctrl && alt => {
+            ui::git_status_panel::handle_command(
+                app,
+                "git.stashDropPrompt",
+                &serde_json::json!({}),
+            );
+        }
+        KeyCode::Char('k') if ctrl && alt => {
+            ui::git_status_panel::handle_command(
+                app,
+                "git.stashApplyIndex",
+                &serde_json::json!({}),
+            );
+        }
+        KeyCode::Char('n') if ctrl && alt => {
+            ui::git_status_panel::handle_command(app, "git.stashBranch", &serde_json::json!({}));
+        }
         KeyCode::Char('s') => {
             ui::git_status_panel::handle_key(app, "s");
         }
@@ -1413,14 +1569,16 @@ fn handle_key_git(key: KeyEvent, app: &mut App) {
         KeyCode::Char('f') => {
             app.toggle_diff_mode();
         }
+        KeyCode::Enter if app.active_panel == Panel::Files => {
+            app.activate_git_keyboard_focus();
+        }
         KeyCode::Char('e') | KeyCode::Enter => {
             // Edit the currently selected changed file. Ignore if nothing's
             // selected (empty status) or the repo's gone. A Deleted-status
             // file will be recreated by the editor if the user writes — same
             // behaviour you'd get running `$EDITOR path/to/deleted` in a shell.
-            if let Some(sel) = &app.selected_file {
-                let workdir = app.backend.workdir_path();
-                app.pending_edit = Some(workdir.join(&sel.path));
+            if let Some(path) = app.selected_git_file_path() {
+                app.pending_edit = Some(path);
             }
         }
         _ => {}
@@ -2195,7 +2353,7 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                 // Shift+Click on a graph row = extend the range, for
                 // terminals that actually forward Shift+Click to the app.
                 // Most macOS terminals intercept this for text selection;
-                // those users should press `V` to enter visual mode and
+                // those users should press Ctrl+Alt+V to enter visual mode and
                 // click normally instead — the in-visual-mode click path
                 // lives in `git_graph_panel::handle_command`.
                 if mouse.modifiers.contains(KeyModifiers::SHIFT)
@@ -2382,6 +2540,11 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                         app.preview_scroll = app.preview_scroll.saturating_sub(3);
                     }
                 }
+                Tab::Containers => {
+                    if is_left {
+                        app.move_container_selection(-3);
+                    }
+                }
             }
         }
         MouseEventKind::ScrollDown => {
@@ -2428,6 +2591,11 @@ pub fn handle_mouse<B: Backend>(mouse: MouseEvent, app: &mut App, terminal: &Ter
                         global_search::move_selection_by(app, 3);
                     } else {
                         app.preview_scroll += 3;
+                    }
+                }
+                Tab::Containers => {
+                    if is_left {
+                        app.move_container_selection(3);
                     }
                 }
             }
@@ -2890,6 +3058,7 @@ fn apply_horizontal_scroll(app: &mut App, column: u16, total_width: u16, delta: 
             }
         },
         (Tab::Search, false) => Some(&mut app.preview_h_scroll),
+        (Tab::Containers, false) => None,
         (Tab::Graph, false) => {
             // In 3-col mode the right portion is [commit | diff]; figure
             // out which column the cursor sits over so h_scroll targets

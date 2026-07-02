@@ -18,18 +18,23 @@ use std::thread;
 use std::time::Duration;
 
 use reef_proto::{
-    ContentSearchCompletedDto, ContentSearchRequestDto, DatabaseInfoDto, DirEntryDto, Envelope,
-    MatchHitDto, Notification, ReadFileResponse, RepoDiscoverOptsDto, RepoDiscoverResponseDto,
-    Request, Response, TrashResponseDto, WalkOptsDto, WalkResponseDto, decode_frame, encode_frame,
+    ContainerActionDto, ContainerInfoDto, ContainerStateDto, ContentSearchCompletedDto,
+    ContentSearchRequestDto, DatabaseInfoDto, DirEntryDto, Envelope, MatchHitDto, Notification,
+    ReadFileResponse, RepoDiscoverOptsDto, RepoDiscoverResponseDto, Request, Response,
+    TrashResponseDto, WalkOptsDto, WalkResponseDto, decode_frame, encode_frame,
 };
 
 use super::{
-    Backend, BackendError, ContentMatchHit, ContentSearchCompleted, ContentSearchRequest,
-    EditorLaunchSpec, RepoDiscoverOpts, RepoDiscoverResponse, SearchChunkSink, StatusSnapshot,
-    TrashOutcome, WalkOpts, WalkResponse, WorkspaceRepoMeta, normalize_repo_root_rel, repo_key,
+    Backend, BackendError, ContainerAction, ContainerInfo, ContainerState, ContentMatchHit,
+    ContentSearchCompleted, ContentSearchRequest, EditorLaunchSpec, RepoDiscoverOpts,
+    RepoDiscoverResponse, SearchChunkSink, StatusSnapshot, TrashOutcome, WalkOpts, WalkResponse,
+    WorkspaceRepoMeta, normalize_repo_root_rel, repo_key,
 };
 use crate::file_tree::{PreviewContent, TreeEntry};
-use crate::git::{CommitDetail, CommitInfo, DiffContent, FileEntry, RefLabel};
+use crate::git::{
+    CommitDetail, CommitInfo, DiffContent, FileEntry, RefLabel, StashDetail, StashEntry,
+    StashPushOptions,
+};
 use std::ops::ControlFlow;
 
 /// Default timeout for a single RPC round-trip. Applied to every `request`
@@ -40,6 +45,9 @@ const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 /// limits applied in `file_tree::load_preview` (512 KB highlight cap + some
 /// headroom for un-highlighted previews).
 const READ_FILE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Keep stash detail replies comfortably below reef-proto's 16 MiB frame cap.
+const MAX_STASH_PATCH_BYTES: usize = 8 * 1024 * 1024;
 
 type PendingMap = HashMap<u64, mpsc::Sender<Response>>;
 /// `request_id` → sender for streaming `SearchChunk` notifications. The
@@ -491,6 +499,19 @@ impl Backend for RemoteBackend {
         })
     }
 
+    fn list_containers(&self) -> Result<Vec<ContainerInfo>, BackendError> {
+        let resp: Vec<ContainerInfoDto> = self.request(Request::ListContainers)?;
+        Ok(resp.into_iter().map(container_info_from_dto).collect())
+    }
+
+    fn container_action(&self, id: &str, action: ContainerAction) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request(Request::ContainerAction {
+            id: id.to_string(),
+            action: container_action_to_dto(action),
+        })?;
+        Ok(())
+    }
+
     fn build_file_tree(
         &self,
         expanded: &HashSet<PathBuf>,
@@ -574,15 +595,15 @@ impl Backend for RemoteBackend {
             lines
         };
 
-        let highlighted = if raw.len() <= 512 * 1024 && lines.len() <= 5_000 {
-            crate::ui::highlight::highlight_file(&rel_str, &lines, dark)
-        } else {
-            None
-        };
+        let _ = dark;
 
         Some(PreviewContent {
             file_path: rel_str,
-            body: PreviewBody::Text { lines, highlighted },
+            body: PreviewBody::Text {
+                lines,
+                highlighted: None,
+                source_bytes: raw.len(),
+            },
         })
     }
 
@@ -815,6 +836,22 @@ impl Backend for RemoteBackend {
         Ok(())
     }
 
+    fn publish_branch(&self) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request(Request::PublishBranch)?;
+        Ok(())
+    }
+
+    fn publish_branch_for(&self, repo_root_rel: &Path) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.publish_branch();
+        }
+        let _: serde_json::Value = self.request(Request::PublishBranchFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+        })?;
+        Ok(())
+    }
+
     fn pull(&self) -> Result<(), BackendError> {
         let _: serde_json::Value = self.request(Request::Pull)?;
         Ok(())
@@ -845,6 +882,210 @@ impl Backend for RemoteBackend {
         }
         let _: serde_json::Value = self.request(Request::CheckoutBranchFor {
             repo_root_rel: repo_key(&repo_root_rel),
+            branch: branch.to_string(),
+        })?;
+        Ok(())
+    }
+
+    fn create_branch(&self, branch: &str, base: Option<&str>) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request(Request::CreateBranch {
+            branch: branch.to_string(),
+            base: base.map(str::to_string),
+        })?;
+        Ok(())
+    }
+
+    fn create_branch_for(
+        &self,
+        repo_root_rel: &Path,
+        branch: &str,
+        base: Option<&str>,
+    ) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.create_branch(branch, base);
+        }
+        let _: serde_json::Value = self.request(Request::CreateBranchFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+            branch: branch.to_string(),
+            base: base.map(str::to_string),
+        })?;
+        Ok(())
+    }
+
+    fn merge_branch(&self, branch: &str) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request(Request::MergeBranch {
+            branch: branch.to_string(),
+        })?;
+        Ok(())
+    }
+
+    fn merge_branch_for(&self, repo_root_rel: &Path, branch: &str) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.merge_branch(branch);
+        }
+        let _: serde_json::Value = self.request(Request::MergeBranchFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+            branch: branch.to_string(),
+        })?;
+        Ok(())
+    }
+
+    fn list_stashes(&self) -> Result<Vec<StashEntry>, BackendError> {
+        let resp: Vec<reef_proto::StashEntryDto> = self.request(Request::ListStashes)?;
+        Ok(resp.into_iter().map(Into::into).collect())
+    }
+
+    fn list_stashes_for(&self, repo_root_rel: &Path) -> Result<Vec<StashEntry>, BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.list_stashes();
+        }
+        let resp: Vec<reef_proto::StashEntryDto> = self.request(Request::ListStashesFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+        })?;
+        Ok(resp.into_iter().map(Into::into).collect())
+    }
+
+    fn stash_detail(&self, stash_ref: &str) -> Result<StashDetail, BackendError> {
+        let resp: reef_proto::StashDetailDto = self.request(Request::StashDetail {
+            stash_ref: stash_ref.to_string(),
+        })?;
+        Ok(resp.into())
+    }
+
+    fn stash_detail_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+    ) -> Result<StashDetail, BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.stash_detail(stash_ref);
+        }
+        let resp: reef_proto::StashDetailDto = self.request(Request::StashDetailFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+            stash_ref: stash_ref.to_string(),
+        })?;
+        Ok(resp.into())
+    }
+
+    fn stash_push(&self, options: &StashPushOptions) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request(Request::StashPush {
+            options: options.clone().into(),
+        })?;
+        Ok(())
+    }
+
+    fn stash_push_for(
+        &self,
+        repo_root_rel: &Path,
+        options: &StashPushOptions,
+    ) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.stash_push(options);
+        }
+        let _: serde_json::Value = self.request(Request::StashPushFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+            options: options.clone().into(),
+        })?;
+        Ok(())
+    }
+
+    fn stash_apply(&self, stash_ref: &str, reinstate_index: bool) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request(Request::StashApply {
+            stash_ref: stash_ref.to_string(),
+            reinstate_index,
+        })?;
+        Ok(())
+    }
+
+    fn stash_apply_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+        reinstate_index: bool,
+    ) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.stash_apply(stash_ref, reinstate_index);
+        }
+        let _: serde_json::Value = self.request(Request::StashApplyFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+            stash_ref: stash_ref.to_string(),
+            reinstate_index,
+        })?;
+        Ok(())
+    }
+
+    fn stash_pop(&self, stash_ref: &str, reinstate_index: bool) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request(Request::StashPop {
+            stash_ref: stash_ref.to_string(),
+            reinstate_index,
+        })?;
+        Ok(())
+    }
+
+    fn stash_pop_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+        reinstate_index: bool,
+    ) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.stash_pop(stash_ref, reinstate_index);
+        }
+        let _: serde_json::Value = self.request(Request::StashPopFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+            stash_ref: stash_ref.to_string(),
+            reinstate_index,
+        })?;
+        Ok(())
+    }
+
+    fn stash_drop(&self, stash_ref: &str) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request(Request::StashDrop {
+            stash_ref: stash_ref.to_string(),
+        })?;
+        Ok(())
+    }
+
+    fn stash_drop_for(&self, repo_root_rel: &Path, stash_ref: &str) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.stash_drop(stash_ref);
+        }
+        let _: serde_json::Value = self.request(Request::StashDropFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+            stash_ref: stash_ref.to_string(),
+        })?;
+        Ok(())
+    }
+
+    fn stash_branch(&self, stash_ref: &str, branch: &str) -> Result<(), BackendError> {
+        let _: serde_json::Value = self.request(Request::StashBranch {
+            stash_ref: stash_ref.to_string(),
+            branch: branch.to_string(),
+        })?;
+        Ok(())
+    }
+
+    fn stash_branch_for(
+        &self,
+        repo_root_rel: &Path,
+        stash_ref: &str,
+        branch: &str,
+    ) -> Result<(), BackendError> {
+        let repo_root_rel = normalize_repo_root_rel(repo_root_rel)?;
+        if repo_root_rel == Path::new(".") {
+            return self.stash_branch(stash_ref, branch);
+        }
+        let _: serde_json::Value = self.request(Request::StashBranchFor {
+            repo_root_rel: repo_key(&repo_root_rel),
+            stash_ref: stash_ref.to_string(),
             branch: branch.to_string(),
         })?;
         Ok(())
@@ -1462,6 +1703,157 @@ impl From<reef_proto::FileEntryDto> for FileEntry {
             status: v.status.into(),
             additions: v.additions,
             deletions: v.deletions,
+        }
+    }
+}
+
+fn container_info_from_dto(v: ContainerInfoDto) -> ContainerInfo {
+    ContainerInfo {
+        id: v.id,
+        image: v.image,
+        command: v.command,
+        created: v.created,
+        status: v.status,
+        names: v.names,
+        ports: v.ports,
+        state: container_state_from_dto(v.state),
+    }
+}
+
+fn container_state_from_dto(v: ContainerStateDto) -> ContainerState {
+    match v {
+        ContainerStateDto::Running => ContainerState::Running,
+        ContainerStateDto::Exited => ContainerState::Exited,
+        ContainerStateDto::Paused => ContainerState::Paused,
+        ContainerStateDto::Restarting => ContainerState::Restarting,
+        ContainerStateDto::Created => ContainerState::Created,
+        ContainerStateDto::Dead => ContainerState::Dead,
+        ContainerStateDto::Other => ContainerState::Other,
+    }
+}
+
+fn container_action_to_dto(v: ContainerAction) -> ContainerActionDto {
+    match v {
+        ContainerAction::Start => ContainerActionDto::Start,
+        ContainerAction::Stop => ContainerActionDto::Stop,
+        ContainerAction::Restart => ContainerActionDto::Restart,
+    }
+}
+
+impl From<reef_proto::StashPushOptionsDto> for StashPushOptions {
+    fn from(v: reef_proto::StashPushOptionsDto) -> Self {
+        StashPushOptions {
+            message: v.message,
+            include_untracked: v.include_untracked,
+            keep_index: v.keep_index,
+            staged_only: v.staged_only,
+            paths: v.paths,
+        }
+    }
+}
+
+impl From<StashPushOptions> for reef_proto::StashPushOptionsDto {
+    fn from(v: StashPushOptions) -> Self {
+        reef_proto::StashPushOptionsDto {
+            message: v.message,
+            include_untracked: v.include_untracked,
+            keep_index: v.keep_index,
+            staged_only: v.staged_only,
+            paths: v.paths,
+        }
+    }
+}
+
+impl From<reef_proto::StashEntryDto> for StashEntry {
+    fn from(v: reef_proto::StashEntryDto) -> Self {
+        StashEntry {
+            index: v.index,
+            stash_ref: v.stash_ref,
+            message: v.message,
+            created: v.created,
+            branch: v.branch,
+            files_changed: v.files_changed,
+            insertions: v.insertions,
+            deletions: v.deletions,
+            includes_untracked: v.includes_untracked,
+        }
+    }
+}
+
+impl From<StashEntry> for reef_proto::StashEntryDto {
+    fn from(v: StashEntry) -> Self {
+        reef_proto::StashEntryDto {
+            index: v.index,
+            stash_ref: v.stash_ref,
+            message: v.message,
+            created: v.created,
+            branch: v.branch,
+            files_changed: v.files_changed,
+            insertions: v.insertions,
+            deletions: v.deletions,
+            includes_untracked: v.includes_untracked,
+        }
+    }
+}
+
+impl From<reef_proto::StashDetailDto> for StashDetail {
+    fn from(v: reef_proto::StashDetailDto) -> Self {
+        let patch = if v.patch_truncated {
+            format!("{}\n... stash patch truncated ...", v.patch)
+        } else {
+            v.patch
+        };
+        StashDetail {
+            entry: v.entry.into(),
+            files: v.files.into_iter().map(Into::into).collect(),
+            patch,
+        }
+    }
+}
+
+impl From<StashDetail> for reef_proto::StashDetailDto {
+    fn from(v: StashDetail) -> Self {
+        let (patch, patch_truncated) = truncate_string_bytes(v.patch, MAX_STASH_PATCH_BYTES);
+        reef_proto::StashDetailDto {
+            entry: v.entry.into(),
+            files: v.files.into_iter().map(Into::into).collect(),
+            patch,
+            patch_truncated,
+        }
+    }
+}
+
+fn truncate_string_bytes(mut value: String, max_bytes: usize) -> (String, bool) {
+    if value.len() <= max_bytes {
+        return (value, false);
+    }
+    let mut cut = max_bytes;
+    while !value.is_char_boundary(cut) {
+        cut = cut.saturating_sub(1);
+    }
+    value.truncate(cut);
+    (value, true)
+}
+
+impl From<FileEntry> for reef_proto::FileEntryDto {
+    fn from(v: FileEntry) -> Self {
+        reef_proto::FileEntryDto {
+            path: v.path,
+            status: v.status.into(),
+            additions: v.additions,
+            deletions: v.deletions,
+        }
+    }
+}
+
+impl From<crate::git::FileStatus> for reef_proto::FileStatusDto {
+    fn from(v: crate::git::FileStatus) -> Self {
+        match v {
+            crate::git::FileStatus::Modified => reef_proto::FileStatusDto::Modified,
+            crate::git::FileStatus::Added => reef_proto::FileStatusDto::Added,
+            crate::git::FileStatus::Deleted => reef_proto::FileStatusDto::Deleted,
+            crate::git::FileStatus::Renamed => reef_proto::FileStatusDto::Renamed,
+            crate::git::FileStatus::Untracked => reef_proto::FileStatusDto::Untracked,
         }
     }
 }

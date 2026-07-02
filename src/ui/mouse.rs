@@ -100,6 +100,8 @@ pub enum ClickAction {
     /// keyboard-only, mirroring the file tree where double-click /
     /// Enter is the deliberate-action gate.
     SettingsRow(usize),
+    /// Click on a row in the Containers tab list.
+    ContainerSelect(usize),
 }
 
 #[derive(Debug, Clone)]
